@@ -6,15 +6,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-// InfraLogPrefix Consul KV prefix for infrastructure logs
-const InfraLogPrefix = "infrastructure"
-
-// SoftwareLogPrefix Consul KV prefix for software provisioning logs
-const SoftwareLogPrefix = "software"
-
-// EngineLogPrefix Consul KV prefix for janus engine logs
-const EngineLogPrefix = "engine"
-
 // StatusUpdateType is the status update type
 type StatusUpdateType uint64
 
@@ -33,18 +24,13 @@ const (
 
 // StatusUpdate represents status change event
 type StatusUpdate struct {
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"`
-	Node      string `json:"node,omitempty"`
-	Instance  string `json:"instance,omitempty"`
-	TaskID    string `json:"task_id,omitempty"`
-	Status    string `json:"status"`
-}
-
-// LogEntry represents a log message entry
-type LogEntry struct {
-	Timestamp string `json:"timestamp"`
-	Logs      string `json:"logs"`
+	Timestamp    string `json:"timestamp"`
+	Type         string `json:"type"`
+	Node         string `json:"node,omitempty"`
+	Instance     string `json:"instance,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	DeploymentID string `json:"deployment_id"`
+	Status       string `json:"status"`
 }
 
 const _StatusUpdateType_name = "instancedeploymentcustom-commandscalingworkflow"

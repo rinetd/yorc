@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -14,29 +15,29 @@ import (
 	"syscall"
 	"time"
 
-	"strconv"
-
 	"github.com/hashicorp/consul/api"
 	"github.com/pkg/errors"
+
 	"gopkg.in/yaml.v2"
+
 	"novaforge.bull.com/starlings-janus/janus/config"
 	"novaforge.bull.com/starlings-janus/janus/deployments"
 	"novaforge.bull.com/starlings-janus/janus/events"
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
+	"novaforge.bull.com/starlings-janus/janus/helper/provutil"
+	"novaforge.bull.com/starlings-janus/janus/helper/stringutil"
 	"novaforge.bull.com/starlings-janus/janus/log"
 	"novaforge.bull.com/starlings-janus/janus/prov"
+	"novaforge.bull.com/starlings-janus/janus/prov/operations"
 	"novaforge.bull.com/starlings-janus/janus/tasks"
 	"novaforge.bull.com/starlings-janus/janus/tosca"
 )
 
 const ansibleConfig = `[defaults]
 host_key_checking=False
-timeout=600
+timeout=30
 stdout_callback = json
 retry_files_save_path = #PLAY_PATH#
-
-[ssh_connection]
-retries=5
 `
 
 type ansibleRetriableError struct {
@@ -73,20 +74,6 @@ type hostConnection struct {
 	instanceID string
 }
 
-// An EnvInput represent a TOSCA operation input
-//
-// This element is exported in order to be used by text.Template but should be consider as internal
-type EnvInput struct {
-	Name           string
-	Value          string
-	InstanceName   string
-	IsTargetScoped bool
-}
-
-func (ei EnvInput) String() string {
-	return fmt.Sprintf("EnvInput: [Name: %q, Value: %q, InstanceName: %q, IsTargetScoped: \"%t\"]", ei.Name, ei.Value, ei.InstanceName, ei.IsTargetScoped)
-}
-
 type execution interface {
 	resolveExecution() error
 	execute(ctx context.Context, retry bool) error
@@ -104,8 +91,10 @@ type executionCommon struct {
 	operation                prov.Operation
 	NodeType                 string
 	Description              string
+	OperationRemoteBaseDir   string
 	OperationRemotePath      string
-	EnvInputs                []*EnvInput
+	KeepOperationRemotePath  bool
+	EnvInputs                []*operations.EnvInput
 	VarInputsNames           []string
 	Primary                  string
 	BasePrimary              string
@@ -130,14 +119,16 @@ type executionCommon struct {
 
 func newExecution(kv *api.KV, cfg config.Configuration, taskID, deploymentID, nodeName string, operation prov.Operation) (execution, error) {
 	execCommon := &executionCommon{kv: kv,
-		cfg:            cfg,
-		deploymentID:   deploymentID,
-		NodeName:       nodeName,
-		operation:      operation,
-		VarInputsNames: make([]string, 0),
-		EnvInputs:      make([]*EnvInput, 0),
-		taskID:         taskID,
-		Outputs:        make(map[string]string),
+		cfg:          cfg,
+		deploymentID: deploymentID,
+		NodeName:     nodeName,
+		//KeepOperationRemotePath property is required to be public when resolving templates.
+		KeepOperationRemotePath: cfg.KeepOperationRemotePath,
+		operation:               operation,
+		VarInputsNames:          make([]string, 0),
+		EnvInputs:               make([]*operations.EnvInput, 0),
+		taskID:                  taskID,
+		Outputs:                 make(map[string]string),
 	}
 	if err := execCommon.resolveOperation(); err != nil {
 		return nil, err
@@ -154,10 +145,9 @@ func newExecution(kv *api.KV, cfg config.Configuration, taskID, deploymentID, no
 	if err != nil {
 		return nil, err
 	}
-	// TODO: should use implementation artifacts (tosca.artifacts.Implementation.Bash, tosca.artifacts.Implementation.Python, tosca.artifacts.Implementation.Ansible...) in some way
 	var exec execution
 	if isBash || isPython {
-		execScript := &executionScript{executionCommon: execCommon}
+		execScript := &executionScript{executionCommon: execCommon, isPython: isPython}
 		execCommon.ansibleRunner = execScript
 		exec = execScript
 	} else if isAnsible {
@@ -165,7 +155,7 @@ func newExecution(kv *api.KV, cfg config.Configuration, taskID, deploymentID, no
 		execCommon.ansibleRunner = execAnsible
 		exec = execAnsible
 	} else {
-		return nil, errors.Errorf("Unsupported artifact implementation for node: %q, operation: %q, primary implementation: %q", nodeName, operation.Name, execCommon.Primary)
+		return nil, errors.Errorf("Unsupported artifact implementation for node: %q, operation: %s, primary implementation: %q", nodeName, operation.Name, execCommon.Primary)
 	}
 
 	return exec, exec.resolveExecution()
@@ -278,93 +268,25 @@ func (e *executionCommon) resolveArtifacts() error {
 	return nil
 }
 
-func (e *executionCommon) resolveInputs() error {
-	log.Debug("resolving inputs")
-	resolver := deployments.NewResolver(e.kv, e.deploymentID)
+func (e *executionCommon) resolveHosts(nodeName string) error {
+	// Resolve hosts from the hostedOn hierarchy from bottom to top by finding the first node having a capability
+	// named endpoint and derived from "tosca.capabilities.Endpoint"
 
-	var inputKeys []string
-	var err error
+	log.Debugf("Resolving hosts for node %q", nodeName)
 
-	inputKeys, _, err = e.kv.Keys(e.OperationPath+"/inputs/", "/", nil)
-
+	hostedOnList := make([]string, 0)
+	hostedOnList = append(hostedOnList, nodeName)
+	parentHost, err := deployments.GetHostedOnNode(e.kv, e.deploymentID, nodeName)
 	if err != nil {
 		return err
 	}
-	for _, input := range inputKeys {
-		kvPair, _, err := e.kv.Get(input+"/name", nil)
-		if err != nil {
-			return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
-		}
-		if kvPair == nil {
-			return errors.Errorf("%s/name missing", input)
-		}
-		inputName := string(kvPair.Value)
-
-		kvPair, _, err = e.kv.Get(input+"/is_property_definition", nil)
-		if err != nil {
-			return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
-		}
-		isPropDef, err := strconv.ParseBool(string(kvPair.Value))
+	for parentHost != "" {
+		hostedOnList = append(hostedOnList, parentHost)
+		parentHost, err = deployments.GetHostedOnNode(e.kv, e.deploymentID, parentHost)
 		if err != nil {
 			return err
 		}
-
-		va := tosca.ValueAssignment{}
-		var targetContext bool
-		if !isPropDef {
-			kvPair, _, err = e.kv.Get(input+"/expression", nil)
-			if err != nil {
-				return err
-			}
-			if kvPair == nil {
-				return errors.Errorf("%s/expression missing", input)
-			}
-
-			err = yaml.Unmarshal(kvPair.Value, &va)
-			if err != nil {
-				return errors.Wrap(err, "Failed to resolve operation inputs, unable to unmarshal yaml expression: ")
-			}
-			targetContext = va.Expression.IsTargetContext()
-		}
-
-		var instancesIds []string
-		if targetContext {
-			instancesIds = e.targetNodeInstances
-		} else {
-			instancesIds = e.sourceNodeInstances
-		}
-		var inputValue string
-		for i, instanceID := range instancesIds {
-			envI := &EnvInput{Name: inputName, IsTargetScoped: targetContext}
-			if e.operation.RelOp.IsRelationshipOperation && targetContext {
-				envI.InstanceName = getInstanceName(e.operation.RelOp.TargetNodeName, instanceID)
-			} else {
-				envI.InstanceName = getInstanceName(e.NodeName, instanceID)
-			}
-			if e.operation.RelOp.IsRelationshipOperation {
-				inputValue, err = resolver.ResolveExpressionForRelationship(va.Expression, e.NodeName, e.operation.RelOp.TargetNodeName, e.operation.RelOp.RequirementIndex, instanceID)
-			} else if isPropDef {
-				inputValue, err = tasks.GetTaskInput(e.kv, e.taskID, inputName)
-			} else {
-				inputValue, err = resolver.ResolveExpressionForNode(va.Expression, e.NodeName, instanceID)
-			}
-			if err != nil {
-				return err
-			}
-			envI.Value = inputValue
-			e.EnvInputs = append(e.EnvInputs, envI)
-			if i == 0 {
-				e.VarInputsNames = append(e.VarInputsNames, sanitizeForShell(inputName))
-			}
-		}
 	}
-
-	log.Debugf("Resolved env inputs: %s", e.EnvInputs)
-	return nil
-}
-
-func (e *executionCommon) resolveHosts(nodeName string) error {
-	log.Debugf("Resolving hosts for node %q", nodeName)
 
 	hosts := make(map[string]hostConnection)
 
@@ -375,77 +297,51 @@ func (e *executionCommon) resolveHosts(nodeName string) error {
 		instances = e.sourceNodeInstances
 	}
 
-	for _, instance := range instances {
-		found, ipAddress, err := deployments.GetInstanceCapabilityAttribute(e.kv, e.deploymentID, nodeName, instance, "endpoint", "ip_address")
+	for i := len(hostedOnList) - 1; i >= 0; i-- {
+		host := hostedOnList[i]
+		capType, err := deployments.GetNodeCapabilityType(e.kv, e.deploymentID, host, "endpoint")
 		if err != nil {
 			return err
 		}
-		if found && ipAddress != "" {
-			var instanceName string
-			if e.isRelationshipTargetNode {
-				instanceName = getInstanceName(e.operation.RelOp.TargetNodeName, instance)
-			} else {
-				instanceName = getInstanceName(e.NodeName, instance)
-			}
 
-			hostConn := hostConnection{host: ipAddress, instanceID: instance}
-			var user string
-			found, user, err = deployments.GetNodeProperty(e.kv, e.deploymentID, nodeName, "user")
-			if err != nil {
-				return err
-			}
-			if found && user != "" {
-				va := tosca.ValueAssignment{}
-				err = yaml.Unmarshal([]byte(user), &va)
-				if err != nil {
-					return errors.Wrapf(err, "Unable to resolve username to connect to host %q, unmarshaling yaml failed: ", nodeName)
-				}
-				hostConn.user, err = deployments.NewResolver(e.kv, e.deploymentID).ResolveExpressionForNode(va.Expression, nodeName, instance)
+		hasEndpoint, err := deployments.IsTypeDerivedFrom(e.kv, e.deploymentID, capType, "tosca.capabilities.Endpoint")
+		if err != nil {
+			return err
+		}
+		if hasEndpoint {
+			for _, instance := range instances {
+				found, ipAddress, err := deployments.GetInstanceCapabilityAttribute(e.kv, e.deploymentID, host, instance, "endpoint", "ip_address")
 				if err != nil {
 					return err
 				}
+				if found && ipAddress != "" {
+					instanceName := operations.GetInstanceName(nodeName, instance)
+					hostConn := hostConnection{host: ipAddress, instanceID: instance}
+					var user string
+					found, user, err = deployments.GetNodeProperty(e.kv, e.deploymentID, host, "user")
+					if err != nil {
+						return err
+					}
+					if found {
+						hostConn.user = user
+					}
+					hosts[instanceName] = hostConn
+				}
 			}
-			hosts[instanceName] = hostConn
 		}
 	}
+
 	if len(hosts) == 0 {
-		// So we have to traverse the HostedOn relationships...
-		hostedOnNode, err := deployments.GetHostedOnNode(e.kv, e.deploymentID, nodeName)
-		if err != nil {
-			return err
-		}
-		if hostedOnNode == "" {
-			return errors.Errorf("Can't find an Host with an ip_address in the HostedOn hierarchy for node %q in deployment %q", e.NodeName, e.deploymentID)
-		}
-		return e.resolveHosts(hostedOnNode)
+		return errors.Errorf("Failed to resolve hosts for node %q", nodeName)
 	}
 	e.hosts = hosts
 	return nil
 }
 
-func sanitizeForShell(str string) string {
-	return strings.Map(func(r rune) rune {
-		// Replace hyphen by underscore
-		if r == '-' {
-			return '_'
-		}
-		// Keep underscores
-		if r == '_' {
-			return r
-		}
-		// Drop any other non-alphanum rune
-		if r < '0' || r > 'z' || r > '9' && r < 'A' || r > 'Z' && r < 'a' {
-			return rune(-1)
-		}
-		return r
-
-	}, str)
-}
-
 func (e *executionCommon) resolveContext() error {
 	execContext := make(map[string]string)
 
-	newNode := sanitizeForShell(e.NodeName)
+	newNode := provutil.SanitizeForShell(e.NodeName)
 	if !e.operation.RelOp.IsRelationshipOperation {
 		execContext["NODE"] = newNode
 	}
@@ -458,7 +354,7 @@ func (e *executionCommon) resolveContext() error {
 
 	names := make([]string, len(instances))
 	for i := range instances {
-		instanceName := getInstanceName(e.NodeName, instances[i])
+		instanceName := operations.GetInstanceName(e.NodeName, instances[i])
 		names[i] = instanceName
 	}
 	if !e.operation.RelOp.IsRelationshipOperation {
@@ -490,14 +386,14 @@ func (e *executionCommon) resolveContext() error {
 
 		sourceNames := make([]string, len(e.sourceNodeInstances))
 		for i := range e.sourceNodeInstances {
-			sourceNames[i] = getInstanceName(e.NodeName, e.sourceNodeInstances[i])
+			sourceNames[i] = operations.GetInstanceName(e.NodeName, e.sourceNodeInstances[i])
 		}
 		execContext["SOURCE_INSTANCES"] = strings.Join(sourceNames, ",")
-		execContext["TARGET_NODE"] = sanitizeForShell(e.operation.RelOp.TargetNodeName)
+		execContext["TARGET_NODE"] = provutil.SanitizeForShell(e.operation.RelOp.TargetNodeName)
 
 		targetNames := make([]string, len(e.targetNodeInstances))
 		for i := range e.targetNodeInstances {
-			targetNames[i] = getInstanceName(e.operation.RelOp.TargetNodeName, e.targetNodeInstances[i])
+			targetNames[i] = operations.GetInstanceName(e.operation.RelOp.TargetNodeName, e.targetNodeInstances[i])
 		}
 		execContext["TARGET_INSTANCES"] = strings.Join(targetNames, ",")
 
@@ -509,8 +405,8 @@ func (e *executionCommon) resolveContext() error {
 
 	}
 
+	execContext["DEPLOYMENT_ID"] = e.deploymentID
 	e.Context = execContext
-
 	return nil
 }
 
@@ -526,7 +422,6 @@ func (e *executionCommon) resolveOperationOutputPath() error {
 	}
 
 	e.HaveOutput = true
-	va := tosca.ValueAssignment{}
 	//We iterate over all entity of the output in this operation
 	for _, entity := range entities {
 		//We get the name of the output
@@ -543,14 +438,20 @@ func (e *executionCommon) resolveOperationOutputPath() error {
 			if kvPair == nil {
 				return errors.Errorf("Operation output expression is missing for key: %q", output)
 			}
-
-			err = yaml.Unmarshal(kvPair.Value, &va)
+			va := &tosca.ValueAssignment{}
+			err = yaml.Unmarshal(kvPair.Value, va)
 			if err != nil {
 				return errors.Wrap(err, "Fail to parse operation output, check the following expression : ")
 			}
-
-			targetContext := va.Expression.IsTargetContext()
-			sourceContext := va.Expression.IsSourceContext()
+			if va.Type != tosca.ValueAssignmentFunction {
+				return errors.Errorf("Output %q for operation %v is not a valid get_operation_output TOSCA function", path.Base(output), e.operation)
+			}
+			oof := va.GetFunction()
+			if oof.Operator != tosca.GetOperationOutputOperator {
+				return errors.Errorf("Output %q for operation %v (%v) is not a valid get_operation_output TOSCA function", path.Base(output), e.operation, oof)
+			}
+			targetContext := oof.Operands[0].String() == "TARGET"
+			sourceContext := oof.Operands[0].String() == "SOURCE"
 			if (targetContext || sourceContext) && !e.operation.RelOp.IsRelationshipOperation {
 				return errors.Errorf("Can't resolve an operation output in SOURCE or TARGET context without a relationship operation: %q", va.String())
 			}
@@ -566,24 +467,23 @@ func (e *executionCommon) resolveOperationOutputPath() error {
 			for _, instanceID := range instancesIds {
 				//We decide to add an in to differentiate if we export many time the same output
 				b := uint32(time.Now().Nanosecond())
+				interfaceName := strings.ToLower(url.QueryEscape(oof.Operands[1].String()))
+				operationName := strings.ToLower(url.QueryEscape(oof.Operands[2].String()))
+				outputVariableName := url.QueryEscape(oof.Operands[3].String())
 				if targetContext {
-					e.Outputs[va.Expression.Children()[3].Value+"_"+fmt.Sprint(b)] = path.Join("instances", e.operation.RelOp.TargetNodeName, instanceID, "outputs", strings.ToLower(va.Expression.Children()[1].Value), strings.ToLower(va.Expression.Children()[2].Value), va.Expression.Children()[3].Value)
+					e.Outputs[outputVariableName+"_"+fmt.Sprint(b)] = path.Join("instances", e.operation.RelOp.TargetNodeName, instanceID, "outputs", interfaceName, operationName, outputVariableName)
 				} else {
 					//If we are with an expression type {get_operation_output : [ SELF, ...]} in a relationship we store the result in the corresponding relationship instance
-					if va.Expression.Children()[0].Value == "SELF" && e.operation.RelOp.IsRelationshipOperation {
-						relationshipType, err := deployments.GetRelationshipForRequirement(e.kv, e.deploymentID, e.NodeName, e.operation.RelOp.RequirementIndex)
-						if err != nil {
-							return err
-						}
-						relationShipPrefix := filepath.Join("relationship_instances", e.NodeName, relationshipType, instanceID)
-						e.Outputs[va.Expression.Children()[3].Value+"_"+fmt.Sprint(b)] = path.Join(relationShipPrefix, "outputs", strings.ToLower(va.Expression.Children()[1].Value), strings.ToLower(va.Expression.Children()[2].Value), va.Expression.Children()[3].Value)
-					} else if va.Expression.Children()[0].Value == "HOST" {
+					if oof.Operands[0].String() == "SELF" && e.operation.RelOp.IsRelationshipOperation {
+						relationShipPrefix := filepath.Join("relationship_instances", e.NodeName, e.operation.RelOp.RequirementIndex, instanceID)
+						e.Outputs[outputVariableName+"_"+fmt.Sprint(b)] = path.Join(relationShipPrefix, "outputs", interfaceName, operationName, outputVariableName)
+					} else if oof.Operands[0].String() == "HOST" {
 						// In this case we continue because the parsing has change this type on {get_operation_output : [ SELF, ...]}  on the host node
 						continue
 
 					} else {
 						//In all others case we simply save the result of the output on the instance directory of the node
-						e.Outputs[va.Expression.Children()[3].Value+"_"+fmt.Sprint(b)] = path.Join("instances", e.NodeName, instanceID, "outputs", strings.ToLower(va.Expression.Children()[1].Value), strings.ToLower(va.Expression.Children()[2].Value), va.Expression.Children()[3].Value)
+						e.Outputs[outputVariableName+"_"+fmt.Sprint(b)] = path.Join("instances", e.NodeName, instanceID, "outputs", interfaceName, operationName, outputVariableName)
 					}
 				}
 
@@ -620,6 +520,12 @@ func (e *executionCommon) resolveIsPerInstanceOperation(operationName string) er
 	}
 	e.isPerInstanceOperation = false
 	return nil
+}
+
+func (e *executionCommon) resolveInputs() error {
+	var err error
+	e.EnvInputs, e.VarInputsNames, err = operations.ResolveInputsWithInstances(e.kv, e.deploymentID, e.NodeName, e.taskID, e.operation, e.sourceNodeInstances, e.targetNodeInstances)
+	return err
 }
 
 func (e *executionCommon) resolveExecution() error {
@@ -665,7 +571,7 @@ func (e *executionCommon) execute(ctx context.Context, retry bool) error {
 		}
 
 		for _, instanceID := range instances {
-			instanceName := getInstanceName(nodeName, instanceID)
+			instanceName := operations.GetInstanceName(nodeName, instanceID)
 			log.Debugf("Executing operation %q, on node %q, with current instance %q", e.operation.Name, e.NodeName, instanceName)
 			err := e.executeWithCurrentInstance(ctx, retry, instanceName)
 			if err != nil {
@@ -679,7 +585,17 @@ func (e *executionCommon) execute(ctx context.Context, retry bool) error {
 }
 
 func (e *executionCommon) executeWithCurrentInstance(ctx context.Context, retry bool, currentInstance string) error {
-	events.LogEngineMessage(e.kv, e.deploymentID, "Start the ansible execution of : "+e.NodeName+" with operation : "+e.operation.Name)
+	// Fill log optional fields for log registration
+	wfName, _ := tasks.GetTaskData(e.kv, e.taskID, "workflowName")
+	logOptFields := events.LogOptionalFields{
+		events.WorkFlowID:    wfName,
+		events.NodeID:        e.NodeName,
+		events.OperationName: stringutil.GetLastElement(e.operation.Name, "."),
+		events.InstanceID:    currentInstance,
+		events.InterfaceName: stringutil.GetAllExceptLastElement(e.operation.Name, "."),
+	}
+
+	events.WithOptionalFields(logOptFields).NewLogEntry(events.INFO, e.deploymentID).RegisterAsString("Start the ansible execution of : " + e.NodeName + " with operation : " + e.operation.Name)
 	var ansibleRecipePath string
 	if e.operation.RelOp.IsRelationshipOperation {
 		ansibleRecipePath = filepath.Join(e.cfg.WorkingDirectory, "deployments", e.deploymentID, "ansible", e.NodeName, e.relationshipType, e.operation.Name, currentInstance)
@@ -693,12 +609,12 @@ func (e *executionCommon) executeWithCurrentInstance(ctx context.Context, retry 
 	if err = os.RemoveAll(ansibleRecipePath); err != nil {
 		err = errors.Wrapf(err, "Failed to remove ansible recipe directory %q for node %q operation %q", ansibleRecipePath, e.NodeName, e.operation.Name)
 		log.Debugf("%+v", err)
-		events.LogEngineError(e.kv, e.deploymentID, err)
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 		return err
 	}
 	ansibleHostVarsPath := filepath.Join(ansibleRecipePath, "host_vars")
 	if err = os.MkdirAll(ansibleHostVarsPath, 0775); err != nil {
-		events.LogEngineError(e.kv, e.deploymentID, err)
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 		return err
 	}
 	log.Debugf("Generating hosts files hosts: %+v ", e.hosts)
@@ -784,18 +700,20 @@ func (e *executionCommon) executeWithCurrentInstance(ctx context.Context, retry 
 
 	if err = ioutil.WriteFile(filepath.Join(ansibleRecipePath, "hosts"), buffer.Bytes(), 0664); err != nil {
 		err = errors.Wrap(err, "Failed to write hosts file")
-		events.LogEngineError(e.kv, e.deploymentID, err)
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 		return err
 	}
 	if err = ioutil.WriteFile(filepath.Join(ansibleRecipePath, "ansible.cfg"), []byte(strings.Replace(ansibleConfig, "#PLAY_PATH#", ansibleRecipePath, -1)), 0664); err != nil {
 		err = errors.Wrap(err, "Failed to write ansible.cfg file")
-		events.LogEngineError(e.kv, e.deploymentID, err)
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 		return err
 	}
+	// e.OperationRemoteBaseDir is an unique base temp directory for multiple executions
+	e.OperationRemoteBaseDir = stringutil.UniqueTimestampedName(e.cfg.OperationRemoteBaseDir+"_", "")
 	if e.operation.RelOp.IsRelationshipOperation {
-		e.OperationRemotePath = fmt.Sprintf(".janus/%s/%s/%s", e.NodeName, e.relationshipType, e.operation.Name)
+		e.OperationRemotePath = path.Join(e.OperationRemoteBaseDir, e.NodeName, e.relationshipType, e.operation.Name)
 	} else {
-		e.OperationRemotePath = fmt.Sprintf(".janus/%s/%s", e.NodeName, e.operation.Name)
+		e.OperationRemotePath = path.Join(e.OperationRemoteBaseDir, e.NodeName, e.operation.Name)
 	}
 	err = e.ansibleRunner.runAnsible(ctx, retry, currentInstance, ansibleRecipePath)
 	if err != nil {
@@ -805,21 +723,21 @@ func (e *executionCommon) executeWithCurrentInstance(ctx context.Context, retry 
 		outputsFiles, err := filepath.Glob(filepath.Join(ansibleRecipePath, "*-out.csv"))
 		if err != nil {
 			err = errors.Wrapf(err, "Output retrieving of Ansible execution for node %q failed", e.NodeName)
-			events.LogEngineError(e.kv, e.deploymentID, err)
+			events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 			return err
 		}
 		for _, outFile := range outputsFiles {
 			fi, err := os.Open(outFile)
 			if err != nil {
 				err = errors.Wrapf(err, "Output retrieving of Ansible execution for node %q failed", e.NodeName)
-				events.LogEngineError(e.kv, e.deploymentID, err)
+				events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 				return err
 			}
 			r := csv.NewReader(fi)
 			records, err := r.ReadAll()
 			if err != nil {
 				err = errors.Wrapf(err, "Output retrieving of Ansible execution for node %q failed", e.NodeName)
-				events.LogEngineError(e.kv, e.deploymentID, err)
+				events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(err.Error())
 				return err
 			}
 			for _, line := range records {
@@ -834,13 +752,9 @@ func (e *executionCommon) executeWithCurrentInstance(ctx context.Context, retry 
 
 }
 
-func getInstanceName(nodeName, instanceID string) string {
-	return sanitizeForShell(nodeName + "_" + instanceID)
-}
-
-func (e *executionCommon) checkAnsibleRetriableError(err error) error {
-	events.LogEngineError(e.kv, e.deploymentID, errors.Wrapf(err, "Ansible execution for operation %q on node %q failed", e.operation.Name, e.NodeName))
-	log.Debug(err)
+func (e *executionCommon) checkAnsibleRetriableError(err error, logOptFields events.LogOptionalFields) error {
+	events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, e.deploymentID).RegisterAsString(errors.Wrapf(err, "Ansible execution for operation %q on node %q failed", e.operation.Name, e.NodeName).Error())
+	log.Debugf(err.Error())
 	if exiterr, ok := err.(*exec.ExitError); ok {
 		// The program has exited with an exit code != 0
 
@@ -849,8 +763,9 @@ func (e *executionCommon) checkAnsibleRetriableError(err error) error {
 		// defined for both Unix and Windows and in both cases has
 		// an ExitStatus() method with the same signature.
 		if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-			// Retry exit statuses 2 and 3
-			if status.ExitStatus() == 2 || status.ExitStatus() == 3 {
+			// Exit Code 4 is corresponding to unreachable host and is eligible for connection retries
+			// https://github.com/ansible/ansible/blob/devel/lib/ansible/executor/task_queue_manager.py
+			if status.ExitStatus() == 4 {
 				return ansibleRetriableError{root: err}
 			}
 		}

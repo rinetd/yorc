@@ -17,6 +17,12 @@ type ConsulKeys struct {
 	Keys       []ConsulKey `json:"key"`
 }
 
+// A Resource is the base type for terraform resources
+type Resource struct {
+	Connection   *Connection              `json:"connection,omitempty"`
+	Provisioners []map[string]interface{} `json:"provisioner,omitempty"`
+}
+
 // A ConsulKey can be used in a ConsulKeys 'resource' to writes or a ConsulKeys 'data' to read an individual Key/Value pair into Consul
 type ConsulKey struct {
 	Path string `json:"path"`
@@ -38,10 +44,10 @@ type ConsulKey struct {
 //
 // The remote-exec provisioner supports both ssh and winrm type connections.
 type RemoteExec struct {
-	Connection Connection `json:"connection,omitempty"`
-	Inline     []string   `json:"inline,omitempty"`
-	Script     string     `json:"script,omitempty"`
-	Scripts    []string   `json:"scripts,omitempty"`
+	Connection *Connection `json:"connection,omitempty"`
+	Inline     []string    `json:"inline,omitempty"`
+	Script     string      `json:"script,omitempty"`
+	Scripts    []string    `json:"scripts,omitempty"`
 }
 
 // A Connection allows to overwrite the way Terraform connects to a resource
@@ -61,4 +67,33 @@ type Output struct {
 	// This usually includes an interpolation since outputs that are static aren't usually useful.
 	Value     interface{} `json:"value"`
 	Sensitive bool        `json:"sensitive,omitempty"`
+}
+
+// AddResource allows to add a Resource to a defined Infrastructure
+func AddResource(infrastructure *Infrastructure, resourceType, resourceName string, resource interface{}) {
+	if len(infrastructure.Resource) != 0 {
+		if infrastructure.Resource[resourceType] != nil && len(infrastructure.Resource[resourceType].(map[string]interface{})) != 0 {
+			resourcesMap := infrastructure.Resource[resourceType].(map[string]interface{})
+			resourcesMap[resourceName] = resource
+		} else {
+			resourcesMap := make(map[string]interface{})
+			resourcesMap[resourceName] = resource
+			infrastructure.Resource[resourceType] = resourcesMap
+		}
+
+	} else {
+		resourcesMap := make(map[string]interface{})
+		infrastructure.Resource = resourcesMap
+		resourcesMap = make(map[string]interface{})
+		resourcesMap[resourceName] = resource
+		infrastructure.Resource[resourceType] = resourcesMap
+	}
+}
+
+// AddOutput allows to add an Output to a defined Infrastructure
+func AddOutput(infrastructure *Infrastructure, outputName string, output *Output) {
+	if infrastructure.Output == nil {
+		infrastructure.Output = make(map[string]*Output)
+	}
+	infrastructure.Output[outputName] = output
 }

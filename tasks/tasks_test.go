@@ -5,33 +5,16 @@ import (
 	"testing"
 
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
-	"novaforge.bull.com/starlings-janus/janus/log"
 
 	"path"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/testutil"
-	"github.com/stretchr/testify/require"
+	"strconv"
 )
 
-func TestTasks(t *testing.T) {
-	t.Parallel()
-	log.SetDebug(true)
-	srv1, err := testutil.NewTestServer()
-	if err != nil {
-		t.Fatalf("Failed to create consul server: %v", err)
-	}
-	defer srv1.Stop()
-
-	consulConfig := api.DefaultConfig()
-	consulConfig.Address = srv1.HTTPAddr
-
-	client, err := api.NewClient(consulConfig)
-	require.Nil(t, err)
-
-	kv := client.KV()
-
-	srv1.PopulateKV(t, map[string][]byte{
+func populateKV(t *testing.T, srv *testutil.TestServer) {
+	srv.PopulateKV(t, map[string][]byte{
 		consulutil.TasksPrefix + "/t1/targetId":        []byte("id1"),
 		consulutil.TasksPrefix + "/t1/status":          []byte("0"),
 		consulutil.TasksPrefix + "/t1/type":            []byte("0"),
@@ -67,43 +50,14 @@ func TestTasks(t *testing.T) {
 
 		consulutil.DeploymentKVPrefix + "/id1/topology/instances/node2/0/id": []byte("0"),
 		consulutil.DeploymentKVPrefix + "/id1/topology/instances/node2/1/id": []byte("1"),
-	})
 
-	t.Run("tasks", func(t *testing.T) {
-		t.Run("GetTasksIdsForTarget", func(t *testing.T) {
-			testGetTasksIdsForTarget(t, kv)
-		})
-		t.Run("GetTaskStatus", func(t *testing.T) {
-			testGetTaskStatus(t, kv)
-		})
-		t.Run("GetTaskType", func(t *testing.T) {
-			testGetTaskType(t, kv)
-		})
-		t.Run("GetTaskTarget", func(t *testing.T) {
-			testGetTaskTarget(t, kv)
-		})
-		t.Run("TaskExists", func(t *testing.T) {
-			testTaskExists(t, kv)
-		})
-		t.Run("CancelTask", func(t *testing.T) {
-			testCancelTask(t, kv)
-		})
-		t.Run("TargetHasLivingTasks", func(t *testing.T) {
-			testTargetHasLivingTasks(t, kv)
-		})
-		t.Run("GetTaskInput", func(t *testing.T) {
-			testGetTaskInput(t, kv)
-		})
-		t.Run("GetInstances", func(t *testing.T) {
-			testGetInstances(t, kv)
-		})
-		t.Run("GetTaskRelatedNodes", func(t *testing.T) {
-			testGetTaskRelatedNodes(t, kv)
-		})
-		t.Run("testIsTaskRelatedNode", func(t *testing.T) {
-			testIsTaskRelatedNode(t, kv)
-		})
+		consulutil.WorkflowsPrefix + "/t8/step1":  []byte("status1"),
+		consulutil.WorkflowsPrefix + "/t8/step2":  []byte("status2"),
+		consulutil.WorkflowsPrefix + "/t8/step3":  []byte("status3"),
+		consulutil.WorkflowsPrefix + "/t10/step1": []byte("status1"),
+		consulutil.WorkflowsPrefix + "/t11/step1": []byte("status1"),
 
+		consulutil.TasksPrefix + "/t12/status": []byte("3"),
 	})
 }
 
@@ -457,6 +411,169 @@ func testIsTaskRelatedNode(t *testing.T, kv *api.KV) {
 			}
 			if got != tt.want {
 				t.Errorf("IsTaskRelatedNode() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func testGetTaskRelatedWFSteps(t *testing.T, kv *api.KV) {
+	type args struct {
+		kv     *api.KV
+		taskID string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    []TaskStep
+		wantErr bool
+	}{
+		{"TaskWith3Steps", args{kv, "t8"}, []TaskStep{{Name: "step1", Status: "status1"}, {Name: "step2", Status: "status2"}, {Name: "step3", Status: "status3"}}, false},
+		{"TaskWithoutStep", args{kv, "t9"}, []TaskStep{}, false},
+		{"TaskDoesntExist", args{kv, "fake"}, []TaskStep{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetTaskRelatedSteps(tt.args.kv, tt.args.taskID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetTaskRelatedSteps() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetTaskRelatedSteps() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func testUpdateTaskStepStatus(t *testing.T, kv *api.KV) {
+	type args struct {
+		kv     *api.KV
+		taskID string
+		step   *TaskStep
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    *TaskStep
+		wantErr bool
+	}{
+		{"TaskStep", args{kv, "t10", &TaskStep{Name: "step1", Status: "status1"}}, &TaskStep{Name: "step1", Status: "status1Updated"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			UpdateTaskStepStatus(tt.args.kv, tt.args.taskID, tt.want)
+			_, found, err := TaskStepExists(tt.args.kv, tt.args.taskID, tt.args.step.Name)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetTaskRelatedSteps() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(found, tt.want) {
+				t.Errorf("GetTaskRelatedSteps() = %v, want %v", found, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckTaskStepStatusChange(t *testing.T) {
+	type args struct {
+		before string
+		after  string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    bool
+		wantErr bool
+	}{
+		{"ChangeOK", args{"error", "done"}, true, false},
+		{"NotAllowed", args{"initial", "done"}, false, false},
+		{"NotAllowed", args{"initial", "running"}, false, false},
+		{"Error", args{"fake", "fake"}, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, err := CheckTaskStepStatusChange(tt.args.before, tt.args.after)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CheckTaskStepStatusChange() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if ok != tt.want {
+				t.Errorf("CheckTaskStepStatusChange() = %v, want %v", ok, tt.want)
+			}
+		})
+	}
+}
+
+func testTaskStepExists(t *testing.T, kv *api.KV) {
+	type args struct {
+		kv     *api.KV
+		taskID string
+		stepID string
+	}
+	type ret struct {
+		found bool
+		step  *TaskStep
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    ret
+		wantErr bool
+	}{
+		{"TaskStep", args{kv, "t11", "step1"}, ret{true, &TaskStep{Name: "step1", Status: "status1"}}, false},
+		{"TaskStep", args{kv, "fake", "fakeAgain"}, ret{false, nil}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exist, stepFound, err := TaskStepExists(tt.args.kv, tt.args.taskID, tt.args.stepID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("testTaskStepExists() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			result := ret{exist, stepFound}
+			if !reflect.DeepEqual(result, tt.want) {
+				t.Errorf("testTaskStepExists() = %v, want %v", result, tt.want)
+			}
+		})
+	}
+}
+
+func testResumeTask(t *testing.T, kv *api.KV) {
+	type args struct {
+		kv     *api.KV
+		taskID string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{"ResumeTask", args{kv, "t12"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ResumeTask(tt.args.kv, tt.args.taskID); (err != nil) != tt.wantErr {
+				t.Errorf("ResumeTask() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			kvp, _, err := kv.Get(path.Join(consulutil.TasksPrefix, tt.args.taskID, "status"), nil)
+			if err != nil {
+				t.Errorf("Unexpected Consul communication error: %v", err)
+				return
+			}
+			if kvp == nil {
+				t.Error("status missing")
+				return
+			}
+
+			status, err := strconv.Atoi(string(kvp.Value))
+			if err != nil {
+				t.Errorf("Invalid task status:")
+			}
+
+			if TaskStatus(status) != INITIAL {
+				t.Errorf("status not set to \"INITIAL\" but to:%s", TaskStatus(status))
+				return
 			}
 		})
 	}

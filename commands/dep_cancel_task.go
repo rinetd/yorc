@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"net/http"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -31,15 +33,12 @@ var cancelTaskCmd = &cobra.Command{
 
 		request.Header.Add("Accept", "application/json")
 		response, err := client.Do(request)
+		defer response.Body.Close()
 		if err != nil {
 			errExit(err)
 		}
-		if response.StatusCode != 202 {
-			// Try to get the reason
-			printErrors(response.Body)
-			errExit(errors.Errorf("Expecting HTTP Status code 202 got %d, reason %q", response.StatusCode, response.Status))
-		}
-
+		ids := args[0] + "/" + args[1]
+		handleHTTPStatusCode(response, ids, "deployment/task", http.StatusAccepted)
 		return nil
 	},
 }

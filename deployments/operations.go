@@ -2,18 +2,24 @@ package deployments
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
-	"path"
+	yaml "gopkg.in/yaml.v2"
+	"novaforge.bull.com/starlings-janus/janus/prov"
+	"novaforge.bull.com/starlings-janus/janus/tosca"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/pkg/errors"
+
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
 )
 
 // IsOperationNotImplemented checks if a given error is an error indicating that an operation is not implemented
 func IsOperationNotImplemented(err error) bool {
+	err = errors.Cause(err)
 	_, ok := err.(operationNotImplemented)
 	return ok
 }
@@ -26,6 +32,23 @@ func (oni operationNotImplemented) Error() string {
 	return oni.msg
 }
 
+// IsInputNotFound checks if a given error is an error indicating that an input was not found in an operation
+func IsInputNotFound(err error) bool {
+	err = errors.Cause(err)
+	_, ok := err.(inputNotFound)
+	return ok
+}
+
+type inputNotFound struct {
+	inputName          string
+	operationName      string
+	implementationType string
+}
+
+func (inf inputNotFound) Error() string {
+	return fmt.Sprintf("input %q not found for operation %q implemented in type %q", inf.inputName, inf.operationName, inf.implementationType)
+}
+
 const implementationArtifactsExtensionsPath = "implementation_artifacts_extensions"
 
 // GetOperationPathAndPrimaryImplementationForNodeType traverses the type hierarchy to find an operation matching the given operationName.
@@ -34,21 +57,7 @@ const implementationArtifactsExtensionsPath = "implementation_artifacts_extensio
 // If the operation is not found in the type hierarchy then empty strings are returned.
 func GetOperationPathAndPrimaryImplementationForNodeType(kv *api.KV, deploymentID, nodeType, operationName string) (string, string, error) {
 	// First check if operation exists in current nodeType
-	var op string
-	if idx := strings.Index(operationName, "configure."); idx >= 0 {
-		op = operationName[idx:]
-	} else if idx := strings.Index(operationName, "standard."); idx >= 0 {
-		op = operationName[idx:]
-	} else if idx := strings.Index(operationName, "custom."); idx >= 0 {
-		op = operationName[idx:]
-	} else {
-		op = strings.TrimPrefix(operationName, "tosca.interfaces.node.lifecycle.")
-		op = strings.TrimPrefix(op, "tosca.interfaces.relationship.")
-		op = strings.TrimPrefix(op, "tosca.interfaces.node.lifecycle.")
-		op = strings.TrimPrefix(op, "tosca.interfaces.relationship.")
-	}
-	op = strings.Replace(op, ".", "/", -1)
-	operationPath := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "topology/types", nodeType, "interfaces", op)
+	operationPath := getOperationPath(deploymentID, nodeType, operationName)
 	kvp, _, err := kv.Get(path.Join(operationPath, "implementation/primary"), nil)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "Failed to retrieve primary implementation for operation %q on type %q", operationName, nodeType)
@@ -64,6 +73,127 @@ func GetOperationPathAndPrimaryImplementationForNodeType(kv *api.KV, deploymentI
 	}
 
 	return GetOperationPathAndPrimaryImplementationForNodeType(kv, deploymentID, parentType, operationName)
+}
+
+// This function return the path for a given operation
+func getOperationPath(deploymentID, nodeType, operationName string) string {
+	var op string
+	if idx := strings.Index(operationName, "configure."); idx >= 0 {
+		op = operationName[idx:]
+	} else if idx := strings.Index(operationName, "standard."); idx >= 0 {
+		op = operationName[idx:]
+	} else if idx := strings.Index(operationName, "custom."); idx >= 0 {
+		op = operationName[idx:]
+	} else {
+		op = strings.TrimPrefix(operationName, "tosca.interfaces.node.lifecycle.")
+		op = strings.TrimPrefix(op, "tosca.interfaces.relationship.")
+		op = strings.TrimPrefix(op, "tosca.interfaces.node.lifecycle.")
+		op = strings.TrimPrefix(op, "tosca.interfaces.relationship.")
+	}
+	op = strings.Replace(op, ".", "/", -1)
+	operationPath := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "topology/types", nodeType, "interfaces", op)
+
+	return operationPath
+
+}
+
+// GetRelationshipTypeImplementingAnOperation  returns the first (bottom-up) type in the type hierarchy of a given relationship that implements a given operation
+//
+// An error is returned if the operation is not found in the type hierarchy
+func GetRelationshipTypeImplementingAnOperation(kv *api.KV, deploymentID, nodeName, operationName, requirementIndex string) (string, error) {
+	relTypeInit, err := GetRelationshipForRequirement(kv, deploymentID, nodeName, requirementIndex)
+	if err != nil {
+		return "", err
+	}
+	relType := relTypeInit
+	for relType != "" {
+		operationPath := getOperationPath(deploymentID, relType, operationName)
+		kvp, _, err := kv.Get(path.Join(operationPath, "name"), nil)
+		if err != nil {
+			return "", errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+		}
+		if kvp != nil && len(kvp.Value) > 0 {
+			return relType, nil
+		}
+		relType, err = GetParentType(kv, deploymentID, relType)
+	}
+	return "", operationNotImplemented{msg: fmt.Sprintf("Operation %q not found in the type hierarchy of relationship %q", operationName, relTypeInit)}
+}
+
+// GetNodeTypeImplementingAnOperation returns the first (bottom-up) type in the type hierarchy of a given node that implements a given operation
+//
+// This is a shortcut for retrieving the node type and calling the GetTypeImplementingAnOperation() function
+func GetNodeTypeImplementingAnOperation(kv *api.KV, deploymentID, nodeName, operationName string) (string, error) {
+	nodeType, err := GetNodeType(kv, deploymentID, nodeName)
+	if err != nil {
+		return "", err
+	}
+	t, err := GetTypeImplementingAnOperation(kv, deploymentID, nodeType, operationName)
+	return t, errors.Wrapf(err, "operation not found for node %q", nodeName)
+}
+
+// GetTypeImplementingAnOperation returns the first (bottom-up) type in the type hierarchy that implements a given operation
+//
+// An error is returned if the operation is not found in the type hierarchy
+func GetTypeImplementingAnOperation(kv *api.KV, deploymentID, typeName, operationName string) (string, error) {
+	implType := typeName
+	for implType != "" {
+		operationPath := getOperationPath(deploymentID, implType, operationName)
+		kvp, _, err := kv.Get(path.Join(operationPath, "name"), nil)
+		if err != nil {
+			return "", errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+		}
+		if kvp != nil && len(kvp.Value) > 0 {
+			return implType, nil
+		}
+		implType, err = GetParentType(kv, deploymentID, implType)
+	}
+	return "", operationNotImplemented{msg: fmt.Sprintf("operation %q not found in the type hierarchy of type %q", operationName, typeName)}
+}
+
+// GetOperationImplementationType allows you when the implementation of an operation is an artifact to retrieve the type of this artifact
+func GetOperationImplementationType(kv *api.KV, deploymentID, nodeType, operationName string) (string, error) {
+	operationPath := getOperationPath(deploymentID, nodeType, operationName)
+	kvp, _, err := kv.Get(path.Join(operationPath, "implementation/type"), nil)
+	if err != nil {
+		return "", errors.Wrap(err, "Fail to get the type of operation implementation")
+	}
+
+	if kvp == nil {
+		return "", errors.Errorf("Operation type not found for %q", operationName)
+	}
+
+	return string(kvp.Value), nil
+}
+
+// GetOperationImplementationFile allows you when the implementation of an operation is an artifact to retrieve the file of this artifact
+func GetOperationImplementationFile(kv *api.KV, deploymentID, nodeType, operationName string) (string, error) {
+	operationPath := getOperationPath(deploymentID, nodeType, operationName)
+	kvp, _, err := kv.Get(path.Join(operationPath, "implementation/file"), nil)
+	if err != nil {
+		return "", errors.Wrap(err, "Fail to get the file of operation implementation")
+	}
+
+	if kvp == nil {
+		return "", errors.Errorf("Operation type not found for %q", operationName)
+	}
+
+	return string(kvp.Value), nil
+}
+
+// GetOperationImplementationRepository allows you when the implementation of an operation is an artifact to retrieve the repository of this artifact
+func GetOperationImplementationRepository(kv *api.KV, deploymentID, nodeType, operationName string) (string, error) {
+	operationPath := getOperationPath(deploymentID, nodeType, operationName)
+	kvp, _, err := kv.Get(path.Join(operationPath, "implementation/repository"), nil)
+	if err != nil {
+		return "", errors.Wrap(err, "Fail to get the file of operation implementation")
+	}
+
+	if kvp == nil {
+		return "", errors.Errorf("Operation type not found for %q", operationName)
+	}
+
+	return string(kvp.Value), nil
 }
 
 // IsNormativeOperation checks if a given operationName is known as a normative operation.
@@ -155,18 +285,7 @@ func GetOperationOutputForNode(kv *api.KV, deploymentID, nodeName, instanceName,
 // GetOperationOutputForRelationship retrieves an operation output for a relationship
 // The returned value may be empty if the operation output could not be retrieved
 func GetOperationOutputForRelationship(kv *api.KV, deploymentID, nodeName, instanceName, requirementIndex, interfaceName, operationName, outputName string) (string, error) {
-	relationshipType, err := GetRelationshipForRequirement(kv, deploymentID, nodeName, requirementIndex)
-	if err != nil {
-		return "", err
-	}
-	node := nodeName
-	// if IsRelationshipOperationOnTargetNode(operationName) {
-	// 	node, err = GetTargetNodeForRequirement(kv, deploymentID, nodeName, requirementIndex)
-	// 	if err != nil {
-	// 		return "", err
-	// 	}
-	// }
-	result, _, err := kv.Get(path.Join(consulutil.DeploymentKVPrefix, deploymentID, "topology/relationship_instances", node, relationshipType, instanceName, "outputs", strings.ToLower(path.Join(interfaceName, operationName)), outputName), nil)
+	result, _, err := kv.Get(path.Join(consulutil.DeploymentKVPrefix, deploymentID, "topology/relationship_instances", nodeName, requirementIndex, instanceName, "outputs", strings.ToLower(path.Join(interfaceName, operationName)), outputName), nil)
 	if err != nil {
 		return "", err
 	}
@@ -228,7 +347,11 @@ func GetImplementationArtifactForOperation(kv *api.KV, deploymentID, nodeName, o
 		return "", err
 	}
 	if primary == "" {
-		return "", operationNotImplemented{msg: fmt.Sprintf("primary implementation missing for operation %q of type %q in deployment %q is missing", operationName, nodeOrRelType, deploymentID)}
+		implType, err := GetOperationImplementationType(kv, deploymentID, nodeOrRelType, operationName)
+		if err != nil {
+			return "", err
+		}
+		return implType, nil
 	}
 	primarySlice := strings.Split(primary, ".")
 	ext := primarySlice[len(primarySlice)-1]
@@ -240,4 +363,235 @@ func GetImplementationArtifactForOperation(kv *api.KV, deploymentID, nodeName, o
 		return "", errors.Errorf("Failed to resolve implementation artifact for type %q, operation %q, implementation %q and extension %q", nodeOrRelType, operationName, primary, ext)
 	}
 	return artImpl, nil
+}
+
+// GetOperationInputs returns the list of inputs names for a given operation
+func GetOperationInputs(kv *api.KV, deploymentID, typeName, operationName string) ([]string, error) {
+	operationPath := getOperationPath(deploymentID, typeName, operationName)
+
+	inputKeys, _, err := kv.Keys(operationPath+"/inputs/", "/", nil)
+	if err != nil {
+		return nil, errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+	inputs := make([]string, len(inputKeys))
+	for i, input := range inputKeys {
+		inputs[i] = path.Base(input)
+	}
+	return inputs, nil
+}
+
+func getParentOperation(kv *api.KV, deploymentID string, operation prov.Operation) (prov.Operation, error) {
+	parentType, err := GetParentType(kv, deploymentID, operation.ImplementedInType)
+	if err != nil {
+		return prov.Operation{}, err
+	}
+	if parentType != "" {
+		opImplType, err := GetTypeImplementingAnOperation(kv, deploymentID, parentType, operation.Name)
+		if err != nil {
+			return prov.Operation{}, err
+		}
+		return prov.Operation{
+			Name: operation.Name, ImplementationArtifact: operation.ImplementationArtifact,
+			ImplementedInType: opImplType,
+			RelOp: prov.RelationshipOperation{
+				IsRelationshipOperation: operation.RelOp.IsRelationshipOperation,
+				RequirementIndex:        operation.RelOp.RequirementIndex,
+				TargetNodeName:          operation.RelOp.TargetNodeName,
+			},
+		}, nil
+	}
+	return prov.Operation{}, operationNotImplemented{msg: fmt.Sprintf("operation %q not found in the type hierarchy of type %q", operation.Name, operation.ImplementedInType)}
+
+}
+
+// An OperationInputResult represents a result of retrieving an operation input
+//
+// As in case of attributes it may have different values based on the instance name this struct contains the necessary information to identify the result context
+type OperationInputResult struct {
+	NodeName     string
+	InstanceName string
+	Value        string
+}
+
+// GetOperationInput retrieves the value of an input for a given operation
+func GetOperationInput(kv *api.KV, deploymentID, nodeName string, operation prov.Operation, inputName string) ([]OperationInputResult, error) {
+	isPropDef, err := IsOperationInputAPropertyDefinition(kv, deploymentID, operation.ImplementedInType, operation.Name, inputName)
+	if err != nil {
+		return nil, err
+	} else if isPropDef {
+		return nil, errors.Errorf("Input %q for operation %v is a property definition we can't resolve it without a task input", inputName, operation)
+	}
+
+	operationPath := getOperationPath(deploymentID, operation.ImplementedInType, operation.Name)
+	inputPath := path.Join(operationPath, "inputs", inputName, "data")
+	found, res, isFunction, err := getValueAssignmentWithoutResolve(kv, deploymentID, inputPath, "")
+	if err != nil {
+		return nil, err
+	}
+	results := make([]OperationInputResult, 0)
+	if found {
+		if !isFunction {
+			instances, err := GetNodeInstancesIds(kv, deploymentID, nodeName)
+			if err != nil {
+				return nil, err
+			}
+			for _, ins := range instances {
+				results = append(results, OperationInputResult{nodeName, ins, res})
+			}
+			return results, nil
+		}
+		va := &tosca.ValueAssignment{}
+		err = yaml.Unmarshal([]byte(res), va)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to unmarshal TOSCA Function definition %q", res)
+		}
+		f := va.GetFunction()
+		var hasAttrOnTarget bool
+		var hasAttrOnSrcOrSelf bool
+		for _, ga := range f.GetFunctionsByOperator(tosca.GetAttributeOperator) {
+			switch ga.Operands[0].String() {
+			case funcKeywordTARGET:
+				hasAttrOnTarget = true
+			case funcKeywordSELF, funcKeywordSOURCE, funcKeywordHOST:
+				hasAttrOnSrcOrSelf = true
+			}
+		}
+		if hasAttrOnSrcOrSelf && hasAttrOnTarget {
+			return nil, errors.Errorf("can't resolve input %q for operation %v on node %q: get_attribute functions on TARGET and SELF/SOURCE/HOST at the same time is not supported.", inputName, operation, nodeName)
+		}
+		var instances []string
+		var ctxNodeName string
+		if hasAttrOnTarget && operation.RelOp.IsRelationshipOperation {
+			instances, err = GetNodeInstancesIds(kv, deploymentID, operation.RelOp.TargetNodeName)
+			ctxNodeName = operation.RelOp.TargetNodeName
+		} else {
+			instances, err = GetNodeInstancesIds(kv, deploymentID, nodeName)
+			ctxNodeName = nodeName
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, ins := range instances {
+			res, err = resolver(kv, deploymentID).context(withNodeName(nodeName), withInstanceName(ins), withRequirementIndex(operation.RelOp.RequirementIndex)).resolveFunction(f)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, OperationInputResult{ctxNodeName, ins, res})
+		}
+		return results, nil
+
+	}
+	// Check if it is implemented elsewhere
+	newOp, err := getParentOperation(kv, deploymentID, operation)
+	if err != nil {
+		if !IsOperationNotImplemented(err) {
+			return nil, err
+		}
+		return nil, inputNotFound{inputName, operation.Name, operation.ImplementedInType}
+	}
+
+	results, err = GetOperationInput(kv, deploymentID, nodeName, newOp, inputName)
+	if err != nil && IsInputNotFound(err) {
+		return nil, errors.Wrapf(err, "input not found in type %q", operation.ImplementedInType)
+	}
+	return results, err
+}
+
+// GetOperationInputPropertyDefinitionDefault retrieves the default value of an input of type property definition for a given operation
+func GetOperationInputPropertyDefinitionDefault(kv *api.KV, deploymentID, nodeName string, operation prov.Operation, inputName string) ([]OperationInputResult, error) {
+	isPropDef, err := IsOperationInputAPropertyDefinition(kv, deploymentID, operation.ImplementedInType, operation.Name, inputName)
+	if err != nil {
+		return nil, err
+	} else if !isPropDef {
+		return nil, errors.Errorf("Input %q for operation %v is not a property definition we can't resolve its default value", inputName, operation)
+	}
+	operationPath := getOperationPath(deploymentID, operation.ImplementedInType, operation.Name)
+	inputPath := path.Join(operationPath, "inputs", inputName, "default")
+	// TODO base datatype should be retrieved
+	found, res, isFunction, err := getValueAssignmentWithoutResolve(kv, deploymentID, inputPath, "")
+	if err != nil {
+		return nil, err
+	}
+	results := make([]OperationInputResult, 0)
+	if found {
+		if isFunction {
+			return nil, errors.Errorf("can't resolve input %q for operation %v on node %q: TOSCA function are not supported for property definition defaults.", inputName, operation, nodeName)
+		}
+		instances, err := GetNodeInstancesIds(kv, deploymentID, nodeName)
+		if err != nil {
+			return nil, err
+		}
+		for _, ins := range instances {
+			results = append(results, OperationInputResult{nodeName, ins, res})
+		}
+		return results, nil
+	}
+	// Check if it is implemented elsewhere
+	newOp, err := getParentOperation(kv, deploymentID, operation)
+	if err != nil {
+		if !IsOperationNotImplemented(err) {
+			return nil, err
+		}
+		return nil, inputNotFound{inputName, operation.Name, operation.ImplementedInType}
+	}
+
+	results, err = GetOperationInputPropertyDefinitionDefault(kv, deploymentID, nodeName, newOp, inputName)
+	if err != nil && IsInputNotFound(err) {
+		return nil, errors.Wrapf(err, "input not found in type %q", operation.ImplementedInType)
+	}
+	return results, err
+}
+
+// IsOperationInputAPropertyDefinition checks if a given operation input is a property definition
+func IsOperationInputAPropertyDefinition(kv *api.KV, deploymentID, typeName, operationName, inputName string) (bool, error) {
+	operationPath := getOperationPath(deploymentID, typeName, operationName)
+	kvp, _, err := kv.Get(path.Join(operationPath, "inputs", inputName, "is_property_definition"), nil)
+	if err != nil {
+		return false, errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+
+	if kvp == nil || len(kvp.Value) == 0 {
+		return false, errors.Errorf("Operation %q not found for type %q", operationName, typeName)
+	}
+
+	isPropDef, err := strconv.ParseBool(string(kvp.Value))
+	return isPropDef, errors.Wrapf(err, "Failed to parse boolean for operation %q of type %q", operationName, typeName)
+}
+
+// GetOperationInputType retrieves the optional data type of the parameter.
+//
+// As this keyname is required for a TOSCA Property definition, but is not for a TOSCA Parameter definition it may be empty.
+// If the input type is list or map and an entry_schema is provided a semicolon and the entry_schema value are appended to
+// the type (ie list:integer) otherwise string is assumed for then entry_schema.
+func GetOperationInputType(kv *api.KV, deploymentID, typeName, operationName, inputName string) (string, error) {
+	operationPath := getOperationPath(deploymentID, typeName, operationName)
+	kvp, _, err := kv.Get(path.Join(operationPath, "inputs", inputName), nil)
+	if err != nil {
+		return "", errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+	if kvp == nil {
+		parentType, err := GetParentType(kv, deploymentID, typeName)
+		if err != nil {
+			return "", err
+		}
+		if parentType == "" {
+			// input not found
+			return "", inputNotFound{inputName, operationName, typeName}
+		}
+		res, err := GetOperationInputType(kv, deploymentID, parentType, operationName, inputName)
+		return res, errors.Wrapf(err, "input %q not found for operation %q implemented in type %q", inputName, operationName, typeName)
+	}
+	iType := string(kvp.Value)
+	if iType == "list" || iType == "map" {
+		kvp, _, err := kv.Get(path.Join(consulutil.DeploymentKVPrefix, deploymentID, "topology/inputs", inputName, "entry_schema"), nil)
+		if err != nil {
+			return "", errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+		}
+		if kvp != nil && len(kvp.Value) > 0 {
+			iType += ":" + string(kvp.Value)
+		} else {
+			iType += ":string"
+		}
+	}
+	return iType, nil
 }

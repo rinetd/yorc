@@ -10,70 +10,19 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/testutil"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"encoding/json"
+
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
+	"novaforge.bull.com/starlings-janus/janus/testutil"
 )
 
-func TestGroupedEventParallel(t *testing.T) {
-	srv1, err := testutil.NewTestServer()
-	if err != nil {
-		t.Fatalf("Failed to create consul server: %v", err)
-	}
-	defer srv1.Stop()
-
-	config := api.DefaultConfig()
-	config.Address = srv1.HTTPAddr
-
-	client, err := api.NewClient(config)
-	assert.Nil(t, err)
-
-	kv := client.KV()
-
-	consulutil.InitConsulPublisher(500, kv)
-	t.Run("groupEvent", func(t *testing.T) {
-		t.Run("TestConsulPubSubStatusChange", func(t *testing.T) {
-			ConsulPubSubStatusChange(t, kv)
-		})
-		t.Run("TestConsulPubSubNewEvents", func(t *testing.T) {
-			ConsulPubSubNewEvents(t, kv)
-		})
-		t.Run("TestConsulPubSubNewEventsTimeout", func(t *testing.T) {
-			ConsulPubSubNewEventsTimeout(t, kv)
-		})
-		t.Run("TestConsulPubSubNewEventsWithIndex", func(t *testing.T) {
-			ConsulPubSubNewEventsWithIndex(t, kv)
-		})
-		t.Run("TestConsulPubSubNewNodeEvents", func(t *testing.T) {
-			ConsulPubSubNewNodeEvents(t, kv)
-		})
-		t.Run("TestDeploymentStatusChange", func(t *testing.T) {
-			consulDeploymentStatusChange(t, kv)
-		})
-		t.Run("TestCustomCommandStatusChange", func(t *testing.T) {
-			consulCustomCommandStatusChange(t, kv)
-		})
-		t.Run("TestScalingStatusChange", func(t *testing.T) {
-			consulScalingStatusChange(t, kv)
-		})
-		t.Run("TestWorkflowStatusChange", func(t *testing.T) {
-			consulWorkflowStatusChange(t, kv)
-		})
-		t.Run("TestGetStatusEvents", func(t *testing.T) {
-			consulGetStatusEvents(t, kv)
-		})
-		t.Run("TestGetLogs", func(t *testing.T) {
-			consulGetLogs(t, kv)
-		})
-	})
-}
-
-func ConsulPubSubStatusChange(t *testing.T, kv *api.KV) {
+func testConsulPubSubStatusChange(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "test1"
+	deploymentID := testutil.BuildDeploymentID(t)
 
 	var testData = []struct {
 		node     string
@@ -98,7 +47,7 @@ func ConsulPubSubStatusChange(t *testing.T, kv *api.KV) {
 		assert.Nil(t, err)
 		ids = append(ids, id)
 	}
-	prefix := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "events")
+	prefix := path.Join(consulutil.EventsPrefix, deploymentID)
 	kvps, _, err := kv.List(prefix, nil)
 	assert.Nil(t, err)
 	assert.Len(t, kvps, len(testData))
@@ -110,11 +59,10 @@ func ConsulPubSubStatusChange(t *testing.T, kv *api.KV) {
 	}
 }
 
-func ConsulPubSubNewEvents(t *testing.T, kv *api.KV) {
+func testConsulPubSubNewEvents(t *testing.T, kv *api.KV) {
 	// Do not run this test in // as it cause some concurrency issue
 	// t.Parallel()
-	deploymentID := "test2"
-	sub := NewSubscriber(kv, deploymentID)
+	deploymentID := testutil.BuildDeploymentID(t)
 
 	nodeName := "node1"
 	instance := "0"
@@ -126,7 +74,7 @@ func ConsulPubSubNewEvents(t *testing.T, kv *api.KV) {
 		i, err := GetStatusEventsIndex(kv, deploymentID)
 		require.Nil(t, err)
 		ready <- struct{}{}
-		events, _, err := sub.StatusEvents(i, 5*time.Minute)
+		events, _, err := StatusEvents(kv, deploymentID, i, 5*time.Minute)
 		assert.Nil(t, err)
 		require.Len(t, events, 1)
 		assert.Equal(t, events[0].Node, nodeName)
@@ -138,25 +86,23 @@ func ConsulPubSubNewEvents(t *testing.T, kv *api.KV) {
 	assert.Nil(t, err)
 }
 
-func ConsulPubSubNewEventsTimeout(t *testing.T, kv *api.KV) {
+func testConsulPubSubNewEventsTimeout(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "test3"
-	sub := NewSubscriber(kv, deploymentID)
+	deploymentID := testutil.BuildDeploymentID(t)
 
 	timeout := 25 * time.Millisecond
 
 	t1 := time.Now()
-	events, _, err := sub.StatusEvents(1, timeout)
+	events, _, err := StatusEvents(kv, deploymentID, 1, timeout)
 	t2 := time.Now()
 	assert.Nil(t, err)
 	require.Len(t, events, 0)
 	assert.WithinDuration(t, t1, t2, timeout+50*time.Millisecond)
 }
 
-func ConsulPubSubNewEventsWithIndex(t *testing.T, kv *api.KV) {
+func testConsulPubSubNewEventsWithIndex(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "test4"
-	sub := NewSubscriber(kv, deploymentID)
+	deploymentID := testutil.BuildDeploymentID(t)
 
 	var testData = []struct {
 		node     string
@@ -174,7 +120,7 @@ func ConsulPubSubNewEventsWithIndex(t *testing.T, kv *api.KV) {
 		assert.Nil(t, err)
 	}
 
-	events, lastIdx, err := sub.StatusEvents(1, 5*time.Minute)
+	events, lastIdx, err := StatusEvents(kv, deploymentID, 1, 5*time.Minute)
 	assert.Nil(t, err)
 	require.Len(t, events, 4)
 	for index, event := range events {
@@ -198,7 +144,7 @@ func ConsulPubSubNewEventsWithIndex(t *testing.T, kv *api.KV) {
 		assert.Nil(t, err)
 	}
 
-	events, lastIdx, err = sub.StatusEvents(lastIdx, 5*time.Minute)
+	events, lastIdx, err = StatusEvents(kv, deploymentID, lastIdx, 5*time.Minute)
 	assert.Nil(t, err)
 	require.Len(t, events, 3)
 	require.NotZero(t, lastIdx)
@@ -210,9 +156,9 @@ func ConsulPubSubNewEventsWithIndex(t *testing.T, kv *api.KV) {
 	}
 }
 
-func ConsulPubSubNewNodeEvents(t *testing.T, kv *api.KV) {
+func testConsulPubSubNewNodeEvents(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "test5"
+	deploymentID := testutil.BuildDeploymentID(t)
 
 	nodeName := "node1"
 	instance := "0"
@@ -223,9 +169,9 @@ func ConsulPubSubNewNodeEvents(t *testing.T, kv *api.KV) {
 
 }
 
-func consulDeploymentStatusChange(t *testing.T, kv *api.KV) {
+func testconsulDeploymentStatusChange(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "consulDeploymentStatusChange"
+	deploymentID := testutil.BuildDeploymentID(t)
 	type args struct {
 		kv     *api.KV
 		status string
@@ -253,7 +199,7 @@ func consulDeploymentStatusChange(t *testing.T, kv *api.KV) {
 		})
 	}
 
-	prefix := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "events")
+	prefix := path.Join(consulutil.EventsPrefix, deploymentID)
 	kvps, _, err := kv.List(prefix, nil)
 	assert.Nil(t, err)
 	assert.Len(t, kvps, len(tests))
@@ -266,9 +212,9 @@ func consulDeploymentStatusChange(t *testing.T, kv *api.KV) {
 
 }
 
-func consulCustomCommandStatusChange(t *testing.T, kv *api.KV) {
+func testconsulCustomCommandStatusChange(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "consulCustomCommandChange"
+	deploymentID := testutil.BuildDeploymentID(t)
 	type args struct {
 		kv     *api.KV
 		taskID string
@@ -300,7 +246,7 @@ func consulCustomCommandStatusChange(t *testing.T, kv *api.KV) {
 		})
 	}
 
-	prefix := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "events")
+	prefix := path.Join(consulutil.EventsPrefix, deploymentID)
 	kvps, _, err := kv.List(prefix, nil)
 	assert.Nil(t, err)
 	assert.Len(t, kvps, len(tests))
@@ -313,9 +259,9 @@ func consulCustomCommandStatusChange(t *testing.T, kv *api.KV) {
 
 }
 
-func consulScalingStatusChange(t *testing.T, kv *api.KV) {
+func testconsulScalingStatusChange(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "consulScalingChange"
+	deploymentID := testutil.BuildDeploymentID(t)
 	type args struct {
 		kv     *api.KV
 		taskID string
@@ -347,7 +293,7 @@ func consulScalingStatusChange(t *testing.T, kv *api.KV) {
 		})
 	}
 
-	prefix := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "events")
+	prefix := path.Join(consulutil.EventsPrefix, deploymentID)
 	kvps, _, err := kv.List(prefix, nil)
 	assert.Nil(t, err)
 	assert.Len(t, kvps, len(tests))
@@ -360,9 +306,9 @@ func consulScalingStatusChange(t *testing.T, kv *api.KV) {
 
 }
 
-func consulWorkflowStatusChange(t *testing.T, kv *api.KV) {
+func testconsulWorkflowStatusChange(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "consulWorkflowChange"
+	deploymentID := testutil.BuildDeploymentID(t)
 	type args struct {
 		kv     *api.KV
 		taskID string
@@ -394,7 +340,7 @@ func consulWorkflowStatusChange(t *testing.T, kv *api.KV) {
 		})
 	}
 
-	prefix := path.Join(consulutil.DeploymentKVPrefix, deploymentID, "events")
+	prefix := path.Join(consulutil.EventsPrefix, deploymentID)
 	kvps, _, err := kv.List(prefix, nil)
 	assert.Nil(t, err)
 	assert.Len(t, kvps, len(tests))
@@ -428,28 +374,24 @@ func Test_consulPubSub_StatusEvents(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cp := &consulPubSub{
-				kv:           tt.fields.kv,
-				deploymentID: tt.fields.deploymentID,
-			}
-			got, got1, err := cp.StatusEvents(tt.args.waitIndex, tt.args.timeout)
+			got, got1, err := StatusEvents(tt.fields.kv, tt.fields.deploymentID, tt.args.waitIndex, tt.args.timeout)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("consulPubSub.StatusEvents() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("StatusEvents() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("consulPubSub.StatusEvents() got = %v, want %v", got, tt.want)
+				t.Errorf("StatusEvents() got = %v, want %v", got, tt.want)
 			}
 			if got1 != tt.want1 {
-				t.Errorf("consulPubSub.StatusEvents() got1 = %v, want %v", got1, tt.want1)
+				t.Errorf("StatusEvents() got1 = %v, want %v", got1, tt.want1)
 			}
 		})
 	}
 }
 
-func consulGetStatusEvents(t *testing.T, kv *api.KV) {
+func testconsulGetStatusEvents(t *testing.T, kv *api.KV) {
 	t.Parallel()
-	deploymentID := "consulGetStatusEvents"
+	deploymentID := testutil.BuildDeploymentID(t)
 	ids := make([]string, 5)
 	id, err := InstanceStatusChange(kv, deploymentID, "node1", "1", "started")
 	require.Nil(t, err)
@@ -467,8 +409,7 @@ func consulGetStatusEvents(t *testing.T, kv *api.KV) {
 	require.Nil(t, err)
 	ids[4] = id
 
-	sub := NewSubscriber(kv, deploymentID)
-	events, _, err := sub.StatusEvents(0, 5*time.Minute)
+	events, _, err := StatusEvents(kv, deploymentID, 0, 5*time.Minute)
 	require.Nil(t, err)
 	require.Len(t, events, 5)
 
@@ -509,40 +450,46 @@ func consulGetStatusEvents(t *testing.T, kv *api.KV) {
 
 }
 
-func consulGetLogs(t *testing.T, kv *api.KV) {
+func testconsulGetLogs(t *testing.T, kv *api.KV) {
 	t.Parallel()
 	myErr := errors.New("MyError")
-	deploymentID := "consulGetLogs"
+	deploymentID := testutil.BuildDeploymentID(t)
 	prevIndex, err := GetLogsEventsIndex(kv, deploymentID)
 	require.Nil(t, err)
-	LogEngineError(kv, deploymentID, myErr)
+	SimpleLogEntry(ERROR, deploymentID).RegisterAsString(myErr.Error())
 	newIndex, err := GetLogsEventsIndex(kv, deploymentID)
 	require.Nil(t, err)
 	require.True(t, prevIndex < newIndex)
 	prevIndex = newIndex
-	LogEngineMessage(kv, deploymentID, "message1")
+	SimpleLogEntry(INFO, deploymentID).RegisterAsString("message1")
 	newIndex, err = GetLogsEventsIndex(kv, deploymentID)
 	require.Nil(t, err)
 	require.True(t, prevIndex < newIndex)
 	prevIndex = newIndex
-	LogInfrastructureMessage(kv, deploymentID, "message2")
+	SimpleLogEntry(INFO, deploymentID).RegisterAsString("message2")
 	newIndex, err = GetLogsEventsIndex(kv, deploymentID)
 	require.Nil(t, err)
 	require.True(t, prevIndex < newIndex)
 	prevIndex = newIndex
-	LogSoftwareMessage(kv, deploymentID, "message3")
+	SimpleLogEntry(INFO, deploymentID).RegisterAsString("message3")
 	newIndex, err = GetLogsEventsIndex(kv, deploymentID)
 	require.Nil(t, err)
 	require.True(t, prevIndex < newIndex)
 	prevIndex = newIndex
-	sub := NewSubscriber(kv, deploymentID)
-	events, _, err := sub.LogsEvents("all", 0, 5*time.Minute)
+	logs, _, err := LogsEvents(kv, deploymentID, 0, 5*time.Minute)
 	require.Nil(t, err)
-	require.Len(t, events, 4)
+	require.Len(t, logs, 4)
 
-	require.Equal(t, fmt.Sprintf("%v", myErr), events[0].Logs)
-	require.Equal(t, "message1", events[1].Logs)
-	require.Equal(t, "message2", events[2].Logs)
-	require.Equal(t, "message3", events[3].Logs)
+	require.Equal(t, fmt.Sprintf("%v", myErr), getLogContent(t, logs[0]))
+	require.Equal(t, "message1", getLogContent(t, logs[1]))
+	require.Equal(t, "message2", getLogContent(t, logs[2]))
+	require.Equal(t, "message3", getLogContent(t, logs[3]))
 
+}
+
+func getLogContent(t *testing.T, log []byte) string {
+	var data map[string]interface{}
+	err := json.Unmarshal(log, &data)
+	require.Nil(t, err)
+	return data["content"].(string)
 }

@@ -10,6 +10,8 @@ import (
 	"novaforge.bull.com/starlings-janus/janus/helper/tabutil"
 	"novaforge.bull.com/starlings-janus/janus/rest"
 
+	"net/http"
+
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -22,7 +24,7 @@ func init() {
 var tasksCmd = &cobra.Command{
 	Use:   "tasks <DeploymentId>",
 	Short: "List tasks of a deployment",
-	Long: `Display infos about the tasks related to a given deployment.
+	Long: `Display info about the tasks related to a given deployment.
     It prints the tasks ID, type and status.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) != 1 {
@@ -42,14 +44,11 @@ var tasksCmd = &cobra.Command{
 		}
 		request.Header.Add("Accept", "application/json")
 		response, err := client.Do(request)
+		defer response.Body.Close()
 		if err != nil {
 			errExit(err)
 		}
-		if response.StatusCode != 200 {
-			// Try to get the reason
-			printErrors(response.Body)
-			errExit(errors.Errorf("Expecting HTTP Status code 200 got %d, reason %q", response.StatusCode, response.Status))
-		}
+		handleHTTPStatusCode(response, args[0], "deployment", http.StatusOK)
 		var dep rest.Deployment
 		body, err := ioutil.ReadAll(response.Body)
 		if err != nil {

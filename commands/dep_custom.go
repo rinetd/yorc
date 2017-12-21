@@ -61,15 +61,12 @@ func init() {
 			request.Header.Add("Content-Type", "application/json")
 
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != http.StatusAccepted {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 202 got %d, reason %q", response.StatusCode, response.Status))
-			}
 
+			handleHTTPStatusCode(response, args[0], "deployment", http.StatusAccepted)
 			fmt.Println("Command submitted. path :", response.Header.Get("Location"))
 			return nil
 		},

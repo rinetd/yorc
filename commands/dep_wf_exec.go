@@ -40,14 +40,12 @@ func init() {
 			}
 			request.Header.Add("Content-Type", "application/json")
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != http.StatusAccepted && response.StatusCode != http.StatusCreated {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 201 or 202 got %d, reason %q", response.StatusCode, response.Status))
-			}
+			ids := args[0] + "/" + workflowName
+			handleHTTPStatusCode(response, ids, "deployment/workflow", http.StatusAccepted, http.StatusCreated)
 
 			fmt.Println("New task ", path.Base(response.Header.Get("Location")), " created to execute ", workflowName)
 			if shouldStreamLogs && !shouldStreamEvents {

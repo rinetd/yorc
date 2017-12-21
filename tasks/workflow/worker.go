@@ -15,11 +15,16 @@ import (
 	"github.com/hashicorp/consul/api"
 	"github.com/pkg/errors"
 
+	"time"
+
+	"github.com/armon/go-metrics"
 	"novaforge.bull.com/starlings-janus/janus/config"
 	"novaforge.bull.com/starlings-janus/janus/deployments"
 	"novaforge.bull.com/starlings-janus/janus/events"
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
+	"novaforge.bull.com/starlings-janus/janus/helper/metricsutil"
 	"novaforge.bull.com/starlings-janus/janus/log"
+	"novaforge.bull.com/starlings-janus/janus/prov/operations"
 	"novaforge.bull.com/starlings-janus/janus/tasks"
 	"novaforge.bull.com/starlings-janus/janus/tosca"
 )
@@ -54,7 +59,12 @@ func (w worker) setDeploymentStatus(deploymentID string, status deployments.Depl
 }
 
 func (w worker) processWorkflow(ctx context.Context, workflowName string, wfSteps []*step, deploymentID string, bypassErrors bool) error {
-	events.LogEngineMessage(w.consulClient.KV(), deploymentID, fmt.Sprintf("Start processing workflow %q", workflowName))
+	// Fill log optional fields for log registration
+	logOptFields := events.LogOptionalFields{
+		events.WorkFlowID: workflowName,
+	}
+
+	events.WithOptionalFields(logOptFields).NewLogEntry(events.INFO, deploymentID).RegisterAsString(fmt.Sprintf("Start processing workflow %q", workflowName))
 	uninstallerrc := make(chan error)
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -65,7 +75,7 @@ func (w worker) processWorkflow(ctx context.Context, workflowName string, wfStep
 		// ie in the other go routine and at this time step may have changed as we are in a for loop.
 		func(s *step) {
 			g.Go(func() error {
-				return s.run(ctx, deploymentID, w.consulClient.KV(), uninstallerrc, w.shutdownCh, w.cfg, bypassErrors)
+				return s.run(ctx, deploymentID, w.consulClient.KV(), uninstallerrc, w.shutdownCh, w.cfg, bypassErrors, workflowName)
 			})
 		}(s)
 	}
@@ -87,29 +97,42 @@ func (w worker) processWorkflow(ctx context.Context, workflowName string, wfStep
 	errs := <-faninErrCh
 
 	if err != nil {
-		events.LogEngineMessage(w.consulClient.KV(), deploymentID, fmt.Sprintf("Error '%v' happened in workflow %q.", err, workflowName))
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, deploymentID).RegisterAsString(fmt.Sprintf("Error '%v' happened in workflow %q.", err, workflowName))
 		return err
 	}
 
 	if len(errs) > 0 {
 		uninstallerr := errors.Errorf("%s", strings.Join(errs, " ; "))
-		events.LogEngineMessage(w.consulClient.KV(), deploymentID, fmt.Sprintf("One or more error appear in workflow %q, please check : %v", workflowName, uninstallerr))
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, deploymentID).RegisterAsString(fmt.Sprintf("One or more error appear in workflow %q, please check : %v", workflowName, uninstallerr))
 		log.Printf("DeploymentID %q One or more error appear workflow %q, please check : %v", deploymentID, workflowName, uninstallerr)
 	} else {
-		events.LogEngineMessage(w.consulClient.KV(), deploymentID, fmt.Sprintf("Workflow %q ended without error", workflowName))
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.INFO, deploymentID).RegisterAsString(fmt.Sprintf("Workflow %q ended without error", workflowName))
 		log.Printf("DeploymentID %q Workflow %q ended without error", deploymentID, workflowName)
 	}
 	return nil
 }
 
 func (w worker) handleTask(t *task) {
+	if t.Status() == tasks.INITIAL {
+		metrics.MeasureSince([]string{"tasks", "wait"}, t.creationDate)
+	}
 	t.WithStatus(tasks.RUNNING)
 	kv := w.consulClient.KV()
+
+	// Fill log optional fields for log registration
+	wfName, _ := tasks.GetTaskData(kv, t.ID, "workflowName")
+	logOptFields := events.LogOptionalFields{
+		events.WorkFlowID: wfName,
+	}
 	bgCtx := context.Background()
 	ctx, cancelFunc := context.WithCancel(bgCtx)
 	defer t.releaseLock()
 	defer cancelFunc()
 	w.monitorTaskForCancellation(ctx, cancelFunc, t)
+	defer func(t *task, start time.Time) {
+		metrics.IncrCounter(metricsutil.CleanupMetricKey([]string{"task", t.TargetID, t.TaskType.String(), t.Status().String()}), 1)
+		metrics.MeasureSince(metricsutil.CleanupMetricKey([]string{"task", t.TargetID, t.TaskType.String()}), start)
+	}(t, time.Now())
 	switch t.TaskType {
 	case tasks.Deploy:
 		w.setDeploymentStatus(t.TargetID, deployments.DEPLOYMENT_IN_PROGRESS)
@@ -120,13 +143,21 @@ func (w worker) handleTask(t *task) {
 		}
 		w.setDeploymentStatus(t.TargetID, deployments.DEPLOYED)
 	case tasks.UnDeploy, tasks.Purge:
-		w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYMENT_IN_PROGRESS)
-		err := w.runWorkflows(ctx, t, []string{"uninstall"}, true)
+		status, err := deployments.GetDeploymentStatus(kv, t.TargetID)
 		if err != nil {
-			w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYMENT_FAILED)
+			log.Printf("Deployment id: %q, Task id: %q, Failed to get deployment status: %+v", t.TargetID, t.ID, err)
+			t.WithStatus(tasks.FAILED)
 			return
 		}
-		w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYED)
+		if status != deployments.UNDEPLOYED {
+			w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYMENT_IN_PROGRESS)
+			err := w.runWorkflows(ctx, t, []string{"uninstall"}, true)
+			if err != nil {
+				w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYMENT_FAILED)
+				return
+			}
+			w.setDeploymentStatus(t.TargetID, deployments.UNDEPLOYED)
+		}
 		if t.TaskType == tasks.Purge {
 			_, err := kv.DeleteTree(path.Join(consulutil.DeploymentKVPrefix, t.TargetID), nil)
 			if err != nil {
@@ -155,6 +186,20 @@ func (w worker) handleTask(t *task) {
 					t.WithStatus(tasks.FAILED)
 					return
 				}
+			}
+			// Delete events tree corresponding to the deployment task
+			_, err = kv.DeleteTree(path.Join(consulutil.EventsPrefix, t.TargetID), nil)
+			if err != nil {
+				log.Printf("Deployment id: %q, Task id: %q, Failed to purge events: %+v", t.TargetID, t.ID, err)
+				t.WithStatus(tasks.FAILED)
+				return
+			}
+			// Delete logs tree corresponding to the deployment task
+			_, err = kv.DeleteTree(path.Join(consulutil.LogsPrefix, t.TargetID), nil)
+			if err != nil {
+				log.Printf("Deployment id: %q, Task id: %q, Failed to purge logs: %+v", t.TargetID, t.ID, err)
+				t.WithStatus(tasks.FAILED)
+				return
 			}
 			err = os.RemoveAll(filepath.Join(w.cfg.WorkingDirectory, "deployments", t.TargetID))
 			if err != nil {
@@ -200,7 +245,13 @@ func (w worker) handleTask(t *task) {
 
 		nodeName := nodes[0]
 		commandName := string(commandNameKv.Value)
-		op, err := getOperation(kv, t.TargetID, nodeName, "custom."+commandName)
+		nodeType, err := deployments.GetNodeType(w.consulClient.KV(), t.TargetID, nodeName)
+		if err != nil {
+			log.Printf("Deployment id: %q, Task id: %q, Failed to get Custom command node type: %+v", t.TargetID, t.ID, err)
+			t.WithStatus(tasks.FAILED)
+			return
+		}
+		op, err := operations.GetOperation(kv, t.TargetID, nodeName, "custom."+commandName)
 		if err != nil {
 			log.Printf("Deployment id: %q, Task id: %q, Command execution failed for node %q: %+v", t.TargetID, t.ID, nodeName, err)
 			err = setNodeStatus(t.kv, t.ID, t.TargetID, nodeName, tosca.NodeStateError.String())
@@ -221,7 +272,12 @@ func (w worker) handleTask(t *task) {
 			t.WithStatus(tasks.FAILED)
 			return
 		}
-		if err := exec.ExecOperation(ctx, w.cfg, t.ID, t.TargetID, nodeName, op); err != nil {
+		err = func() error {
+			defer metrics.MeasureSince(metricsutil.CleanupMetricKey([]string{"executor", "operation", t.TargetID, nodeType, op.Name}), time.Now())
+			return exec.ExecOperation(ctx, w.cfg, t.ID, t.TargetID, nodeName, op)
+		}()
+		if err != nil {
+			metrics.IncrCounter(metricsutil.CleanupMetricKey([]string{"executor", "operation", t.TargetID, nodeType, op.Name, "failures"}), 1)
 			log.Printf("Deployment id: %q, Task id: %q, Command execution failed for node %q: %+v", t.TargetID, t.ID, nodeName, err)
 			err = setNodeStatus(t.kv, t.ID, t.TargetID, nodeName, tosca.NodeStateError.String())
 			if err != nil {
@@ -230,6 +286,7 @@ func (w worker) handleTask(t *task) {
 			t.WithStatus(tasks.FAILED)
 			return
 		}
+		metrics.IncrCounter(metricsutil.CleanupMetricKey([]string{"executor", "operation", t.TargetID, nodeType, op.Name, "successes"}), 1)
 	case tasks.ScaleUp:
 		//eventPub := events.NewPublisher(task.kv, task.TargetId)
 		w.setDeploymentStatus(t.TargetID, deployments.SCALING_IN_PROGRESS)
@@ -285,7 +342,7 @@ func (w worker) handleTask(t *task) {
 			return
 		}
 	default:
-		events.LogEngineMessage(kv, t.TargetID, fmt.Sprintf("Unknown TaskType %d (%s) for task with id %q", t.TaskType, t.TaskType.String(), t.ID))
+		events.WithOptionalFields(logOptFields).NewLogEntry(events.ERROR, t.TargetID).RegisterAsString(fmt.Sprintf("Unknown TaskType %d (%s) for task with id %q", t.TaskType, t.TaskType.String(), t.ID))
 		log.Printf("Unknown TaskType %d (%s) for task with id %q and targetId %q", t.TaskType, t.TaskType.String(), t.ID, t.TargetID)
 		if t.Status() == tasks.RUNNING {
 			t.WithStatus(tasks.FAILED)
@@ -334,7 +391,6 @@ func (w worker) Start() {
 		for {
 			// register the current worker into the worker queue.
 			w.workerPool <- w.TaskChannel
-
 			select {
 			case task := <-w.TaskChannel:
 				// we have received a work request.
@@ -370,7 +426,7 @@ func (w worker) monitorTaskForCancellation(ctx context.Context, cancelFunc conte
 
 			if err == nil && kvp != nil {
 				if strings.ToLower(string(kvp.Value)) == "true" {
-					log.Debugln("[TASK MONITOR] Task cancelation requested.")
+					log.Debugln("[TASK MONITOR] Task cancellation requested.")
 					t.WithStatus(tasks.CANCELED)
 					cancelFunc()
 					return
@@ -394,7 +450,18 @@ func (w worker) runWorkflows(ctx context.Context, t *task, workflows []string, b
 		}
 		for _, step := range wf {
 			step.SetTaskID(t)
-			consulutil.StoreConsulKeyAsString(path.Join(consulutil.WorkflowsPrefix, t.ID, step.Name), "")
+			kvp, _, err := kv.Get(path.Join(consulutil.WorkflowsPrefix, t.ID, step.Name), nil)
+			if err != nil {
+				if t.Status() == tasks.RUNNING {
+					t.WithStatus(tasks.FAILED)
+				}
+				log.Printf("%v. Aborting", err)
+				return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+			}
+			// Only create step key if step doesn't already exists to allow resuming task
+			if kvp == nil {
+				consulutil.StoreConsulKeyAsString(path.Join(consulutil.WorkflowsPrefix, t.ID, step.Name), "")
+			}
 		}
 		if err = w.processWorkflow(ctx, workflow, wf, t.TargetID, bypassErrors); err != nil {
 			if t.Status() == tasks.RUNNING {

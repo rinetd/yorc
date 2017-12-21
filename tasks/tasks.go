@@ -1,10 +1,13 @@
 package tasks
 
 import (
+	"fmt"
 	"path"
 	"strconv"
 
 	"strings"
+
+	"time"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/pkg/errors"
@@ -12,6 +15,22 @@ import (
 	"novaforge.bull.com/starlings-janus/janus/events"
 	"novaforge.bull.com/starlings-janus/janus/helper/consulutil"
 )
+
+type taskDataNotFound struct {
+	name   string
+	taskID string
+}
+
+func (t taskDataNotFound) Error() string {
+	return fmt.Sprintf("Data %q not found for task %q", t.name, t.taskID)
+}
+
+// IsTaskDataNotFoundError checks if an error is a task data not found error
+func IsTaskDataNotFoundError(err error) bool {
+	cause := errors.Cause(err)
+	_, ok := cause.(taskDataNotFound)
+	return ok
+}
 
 // TaskTypeForName converts a textual representation of a task into a TaskType
 func TaskTypeForName(taskType string) (TaskType, error) {
@@ -104,6 +123,23 @@ func GetTaskTarget(kv *api.KV, taskID string) (string, error) {
 	return string(kvp.Value), nil
 }
 
+// GetTaskCreationDate retrieves the creationDate of a task
+func GetTaskCreationDate(kv *api.KV, taskID string) (time.Time, error) {
+	kvp, _, err := kv.Get(path.Join(consulutil.TasksPrefix, taskID, "creationDate"), nil)
+	creationDate := time.Time{}
+	if err != nil {
+		return creationDate, errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+	if kvp == nil || len(kvp.Value) == 0 {
+		return creationDate, errors.Errorf("Missing creationDate for task with id %q", taskID)
+	}
+	err = creationDate.UnmarshalBinary(kvp.Value)
+	if err != nil {
+		return creationDate, errors.Wrapf(err, "Failed to get task creationDate for task with id %q", taskID)
+	}
+	return creationDate, nil
+}
+
 // TaskExists checks if a task with the given taskID exists
 func TaskExists(kv *api.KV, taskID string) (bool, error) {
 	kvp, _, err := kv.Get(path.Join(consulutil.TasksPrefix, taskID, "targetId"), nil)
@@ -121,6 +157,16 @@ func CancelTask(kv *api.KV, taskID string) error {
 	kvp := &api.KVPair{Key: path.Join(consulutil.TasksPrefix, taskID, ".canceledFlag"), Value: []byte("true")}
 	_, err := kv.Put(kvp, nil)
 	return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+}
+
+// ResumeTask marks a task as Initial to allow it being resumed
+func ResumeTask(kv *api.KV, taskID string) error {
+	kvp := &api.KVPair{Key: path.Join(consulutil.TasksPrefix, taskID, "status"), Value: []byte(strconv.Itoa(int(INITIAL)))}
+	_, err := kv.Put(kvp, nil)
+	if err != nil {
+		return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+	return nil
 }
 
 // TargetHasLivingTasks checks if a targetID has associated tasks in status INITIAL or RUNNING and returns the id and status of the first one found
@@ -168,7 +214,7 @@ func GetTaskData(kv *api.KV, taskID, dataName string) (string, error) {
 		return "", errors.Wrap(err, consulutil.ConsulGenericErrMsg)
 	}
 	if kvP == nil {
-		return "", errors.Errorf("Data %q not found for task %q", dataName, taskID)
+		return "", errors.WithStack(taskDataNotFound{name: dataName, taskID: taskID})
 	}
 	return string(kvP.Value), nil
 }
@@ -222,4 +268,62 @@ func EmitTaskEvent(kv *api.KV, deploymentID, taskID string, taskType TaskType, s
 		eventID, err = events.ScalingStatusChange(kv, deploymentID, taskID, strings.ToLower(status))
 	}
 	return
+}
+
+// GetTaskRelatedSteps returns the steps of the related workflow
+func GetTaskRelatedSteps(kv *api.KV, taskID string) ([]TaskStep, error) {
+	steps := make([]TaskStep, 0)
+
+	kvps, _, err := kv.List(path.Join(consulutil.WorkflowsPrefix, taskID), nil)
+	if err != nil {
+		return nil, errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+
+	for _, kvp := range kvps {
+		steps = append(steps, TaskStep{Name: path.Base(kvp.Key), Status: string(kvp.Value)})
+	}
+	return steps, nil
+}
+
+// TaskStepExists checks if a task step exists with a stepID and related to a given taskID and returns it
+func TaskStepExists(kv *api.KV, taskID, stepID string) (bool, *TaskStep, error) {
+	kvp, _, err := kv.Get(path.Join(consulutil.WorkflowsPrefix, taskID, stepID), nil)
+	if err != nil {
+		return false, nil, errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+	if kvp == nil || len(kvp.Value) == 0 {
+		return false, nil, nil
+	}
+	return true, &TaskStep{Name: stepID, Status: string(kvp.Value)}, nil
+}
+
+// UpdateTaskStepStatus allows to update the task step status
+func UpdateTaskStepStatus(kv *api.KV, taskID string, step *TaskStep) error {
+	kvp := &api.KVPair{Key: path.Join(consulutil.WorkflowsPrefix, taskID, step.Name), Value: []byte(step.Status)}
+	_, err := kv.Put(kvp, nil)
+	if err != nil {
+		return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+
+	return nil
+}
+
+// CheckTaskStepStatusChange checks if a status change is allowed
+func CheckTaskStepStatusChange(before, after string) (bool, error) {
+	if before == after {
+		return false, errors.New("Final and initial status are identical: nothing to do")
+	}
+	stBefore, err := ParseTaskStepStatus(before)
+	if err != nil {
+		return false, err
+	}
+	stAfter, err := ParseTaskStepStatus(after)
+	if err != nil {
+		return false, err
+	}
+
+	if stBefore != TaskStepStatusERROR || stAfter != TaskStepStatusDONE {
+		return false, nil
+	}
+	return true, nil
 }

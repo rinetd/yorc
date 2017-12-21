@@ -12,7 +12,9 @@ type Topology struct {
 
 	Imports []ImportMap `yaml:"imports,omitempty"`
 
-	// TODO Data Types
+	Repositories map[string]Repository `yaml:"repositories,omitempty"`
+
+	DataTypes         map[string]DataType         `yaml:"data_types,omitempty"`
 	ArtifactTypes     map[string]ArtifactType     `yaml:"artifact_types,omitempty"`
 	NodeTypes         map[string]NodeType         `yaml:"node_types,omitempty"`
 	CapabilityTypes   map[string]CapabilityType   `yaml:"capability_types,omitempty"`
@@ -45,9 +47,28 @@ type NodeTemplate struct {
 	Type         string                          `yaml:"type"`
 	Description  string                          `yaml:"description,omitempty"`
 	Directives   []string                        `yaml:"directives,omitempty"`
-	Properties   map[string]ValueAssignment      `yaml:"properties,omitempty"`
-	Attributes   map[string]ValueAssignment      `yaml:"attributes,omitempty"`
+	Properties   map[string]*ValueAssignment     `yaml:"properties,omitempty"`
+	Attributes   map[string]*ValueAssignment     `yaml:"attributes,omitempty"`
 	Capabilities map[string]CapabilityAssignment `yaml:"capabilities,omitempty"`
 	Requirements []RequirementAssignmentMap      `yaml:"requirements,omitempty"`
 	Artifacts    ArtifactDefMap                  `yaml:"artifacts,omitempty"`
+}
+
+//A Repository is representation of TOSCA Repository
+//
+//See http://docs.oasis-open.org/tosca/TOSCA-Simple-Profile-YAML/v1.0/csprd01/TOSCA-Simple-Profile-YAML-v1.0-csprd01.html#_Toc430015673 for more details
+type Repository struct {
+	URL         string     `yaml:"url,omitempty"`
+	Type        string     `yaml:"type,omitempty"`
+	Description string     `yaml:"description,omitempty"`
+	Credit      Credential `yaml:"credential,omitempty"`
+}
+
+// A Credential is a representation of TOSCA Credential
+type Credential struct {
+	TokenType string            `yaml:"token_type"`
+	Token     string            `yaml:"token"`
+	User      string            `yaml:"user,omitempty"`
+	Protocol  string            `yaml:"protocol,omitempty"`
+	Keys      map[string]string `yaml:"keys,omitempty"`
 }

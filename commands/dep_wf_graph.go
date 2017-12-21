@@ -37,14 +37,12 @@ func init() {
 			}
 			request.Header.Add("Accept", "application/json")
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != http.StatusOK {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 200 got %d, reason %q", response.StatusCode, response.Status))
-			}
+			ids := args[0] + "/" + workflowName
+			handleHTTPStatusCode(response, ids, "deployment/workflow", http.StatusOK)
 
 			var wf rest.Workflow
 			body, err := ioutil.ReadAll(response.Body)

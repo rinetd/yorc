@@ -34,14 +34,11 @@ func init() {
 			}
 			request.Header.Add("Accept", "application/json")
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != http.StatusOK {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 201 or 202 got %d, reason %q", response.StatusCode, response.Status))
-			}
+			handleHTTPStatusCode(response, args[0], "deployment", http.StatusOK)
 
 			var wfs rest.WorkflowsCollection
 			body, err := ioutil.ReadAll(response.Body)

@@ -87,6 +87,11 @@ func errExit(msg interface{}) {
 	os.Exit(1)
 }
 
+func okExit(msg interface{}) {
+	fmt.Println(msg)
+	os.Exit(0)
+}
+
 func printErrors(body io.Reader) {
 	printRestErrors(getRestErrors(body))
 }
@@ -106,6 +111,7 @@ func getJSONEntityFromAtomGetRequest(client *janusClient, atomLink rest.AtomLink
 	request.Header.Add("Accept", "application/json")
 
 	response, err := client.Do(request)
+	defer response.Body.Close()
 	if err != nil {
 		return errors.Wrap(err, janusAPIDefaultErrorMsg)
 	}

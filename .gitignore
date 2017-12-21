@@ -12,6 +12,7 @@ work
 /janus.exe
 /testdata/deployment/*.zip
 /testdata/deployment/*/*.zip
+/janus.zip
 /janus.tgz
 /janus-distrib.zip
 /pkg/janus
@@ -22,6 +23,10 @@ build/consul
 /doc/_build/*
 /dist
 /plugin/testdata/plugin-sample/plugin-sample
+
+# Terraform infra
+/testdata/infra/janus
+/testdata/infra/openstack/terraform.tfstate*
 
 # Generated sources
 /tosca/assets.go

@@ -1,9 +1,9 @@
-FROM loicalbertin/alpine-consul:1.0.3_consul-0.8.1
+FROM loicalbertin/alpine-consul:1.0.4_consul-1.0.1
 ARG TERRAFORM_VERSION
 ARG ANSIBLE_VERSION
 # Update terraform default when possible
 ENV TERRAFORM_VERSION ${TERRAFORM_VERSION:-0.9.8}
-ENV ANSIBLE_VERSION ${ANSIBLE_VERSION:-2.3.1.0}
+ENV ANSIBLE_VERSION ${ANSIBLE_VERSION:-2.4.1.0}
 
 ADD rootfs /
 

@@ -13,6 +13,8 @@ import (
 	"bytes"
 	"strconv"
 
+	"net/http"
+
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -49,14 +51,11 @@ It prints the deployment status and the status of all the nodes contained in thi
 			}
 			request.Header.Add("Accept", "application/json")
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != 200 {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 200 got %d, reason %q", response.StatusCode, response.Status))
-			}
+			handleHTTPStatusCode(response, args[0], "deployment", http.StatusOK)
 			var dep rest.Deployment
 			body, err := ioutil.ReadAll(response.Body)
 			if err != nil {

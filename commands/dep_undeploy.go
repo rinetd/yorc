@@ -3,6 +3,8 @@ package commands
 import (
 	"fmt"
 
+	"net/http"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -36,14 +38,11 @@ func init() {
 
 			request.Header.Add("Accept", "application/json")
 			response, err := client.Do(request)
+			defer response.Body.Close()
 			if err != nil {
 				errExit(err)
 			}
-			if response.StatusCode != 202 {
-				// Try to get the reason
-				printErrors(response.Body)
-				errExit(errors.Errorf("Expecting HTTP Status code 202 got %d, reason %q", response.StatusCode, response.Status))
-			}
+			handleHTTPStatusCode(response, args[0], "deployment", http.StatusAccepted)
 
 			fmt.Println("Undeployment submitted. In progress...")
 			if shouldStreamLogs && !shouldStreamEvents {

@@ -14,5 +14,9 @@ Janus |release| Documentation
    configuration
    run
    cli
+   tosca
+   secured
+   vault
    ha
+   telemetry
 

@@ -6,59 +6,70 @@ import (
 	"io/ioutil"
 	"os"
 	"strconv"
-	"strings"
+
+	"net/http"
 
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"novaforge.bull.com/starlings-janus/janus/events"
 	"novaforge.bull.com/starlings-janus/janus/rest"
 )
 
 func init() {
 	var fromBeginning bool
 	var noStream bool
-	var filters []string
 	var logCmd = &cobra.Command{
-		Use:     "logs <DeploymentId>",
-		Short:   "Stream logs for a deployment",
-		Long:    `Stream logs for a given deployment id`,
+		Use:     "logs [<DeploymentId>]",
+		Short:   "Stream logs for a deployment or all deployments",
+		Long:    `Stream all the logs, or logs for a given deployment id`,
 		Aliases: []string{"log"},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) != 1 {
-				return errors.Errorf("Expecting a deployment id (got %d parameters)", len(args))
+			var deploymentID string
+			if len(args) == 1 {
+				// One deploymentID is provided
+				deploymentID = args[0]
+			} else if len(args) == 0 {
+				fmt.Println("No deployment id provided, logs for all deployments will be returned")
+			} else {
+				return errors.Errorf("Expecting one deployment id or none (got %d parameters)", len(args))
 			}
+
 			client, err := getClient()
 			if err != nil {
 				errExit(err)
 			}
 			colorize := !noColor
 
-			streamsLogs(client, args[0], colorize, fromBeginning, noStream, filters...)
+			streamsLogs(client, deploymentID, colorize, fromBeginning, noStream)
 			return nil
 		},
 	}
-	logCmd.PersistentFlags().BoolVarP(&fromBeginning, "from-beginning", "b", false, "Show logs from the beginning of a deployment")
+	logCmd.PersistentFlags().BoolVarP(&fromBeginning, "from-beginning", "b", false, "Show logs from the beginning of deployments")
 	logCmd.PersistentFlags().BoolVarP(&noStream, "no-stream", "n", false, "Show logs then exit. Do not stream logs. It implies --from-beginning")
-	logCmd.PersistentFlags().StringSliceVarP(&filters, "filter", "f", []string{}, "Allows to filters logs by type. Accepted filters are \"engine\" for Janus logs, \"infrastructure\" for infrastructure provisioning logs or \"software\" for software provisioning. This flag may appear several time and may contain a coma separated list of filters. If not specified logs are not filtered.")
 	deploymentsCmd.AddCommand(logCmd)
 }
 
-func streamsLogs(client *janusClient, deploymentID string, colorize, fromBeginning, stop bool, filters ...string) {
+func streamsLogs(client *janusClient, deploymentID string, colorize, fromBeginning, stop bool) {
 	if colorize {
 		defer color.Unset()
 	}
 	var lastIdx uint64
+	var err error
+	var response *http.Response
+	var request *http.Request
 	if !fromBeginning && !stop {
-		// Get last index
-		response, err := client.Head("/deployments/" + deploymentID + "/logs")
+		if deploymentID != "" {
+			response, err = client.Head("/deployments/" + deploymentID + "/logs")
+			handleHTTPStatusCode(response, deploymentID, "deployment", http.StatusOK)
+		} else {
+			response, err = client.Head("/logs")
+		}
 		if err != nil {
 			errExit(err)
 		}
-		if response.StatusCode != 200 {
-			// Try to get the reason
-			printErrors(response.Body)
-			errExit(errors.Errorf("Expecting HTTP Status code 200 got %d, reason %q", response.StatusCode, response.Status))
-		}
+
+		// Get last index
 		idxHd := response.Header.Get(rest.JanusIndexHeader)
 		if idxHd != "" {
 			lastIdx, err = strconv.ParseUint(idxHd, 10, 64)
@@ -71,11 +82,12 @@ func streamsLogs(client *janusClient, deploymentID string, colorize, fromBeginni
 		}
 	}
 	var filtersParam string
-	if len(filters) > 0 {
-		filtersParam = fmt.Sprintf("&filter=%s", strings.Join(filters, ","))
-	}
 	for {
-		request, err := client.NewRequest("GET", fmt.Sprintf("/deployments/%s/logs?index=%d%s", deploymentID, lastIdx, filtersParam), nil)
+		if deploymentID != "" {
+			request, err = client.NewRequest("GET", fmt.Sprintf("/deployments/%s/logs?index=%d%s", deploymentID, lastIdx, filtersParam), nil)
+		} else {
+			request, err = client.NewRequest("GET", fmt.Sprintf("/logs?index=%d%s", lastIdx, filtersParam), nil)
+		}
 		if err != nil {
 			errExit(err)
 		}
@@ -84,11 +96,11 @@ func streamsLogs(client *janusClient, deploymentID string, colorize, fromBeginni
 		if err != nil {
 			errExit(err)
 		}
-		if response.StatusCode != 200 {
-			// Try to get the reason
-			printErrors(response.Body)
-			errExit(errors.Errorf("Expecting HTTP Status code 200 got %d, reason %q", response.StatusCode, response.Status))
+
+		if deploymentID != "" {
+			handleHTTPStatusCode(response, deploymentID, "deployment", http.StatusOK)
 		}
+
 		var logs rest.LogsCollection
 		body, err := ioutil.ReadAll(response.Body)
 		if err != nil {
@@ -98,17 +110,29 @@ func streamsLogs(client *janusClient, deploymentID string, colorize, fromBeginni
 		if err != nil {
 			errExit(err)
 		}
+
 		lastIdx = logs.LastIndex
 		for _, log := range logs.Logs {
 			if colorize {
-				fmt.Printf("%s: %s\n", color.CyanString("%s", log.Timestamp), log.Logs)
+				fmt.Printf("%s\n", color.CyanString("%s", format(log)))
 			} else {
-				fmt.Printf("%s: %s\n", log.Timestamp, log.Logs)
+				fmt.Printf("%s\n", format(log))
 			}
 		}
+
+		response.Body.Close()
 
 		if stop {
 			return
 		}
 	}
+}
+
+func format(log json.RawMessage) string {
+	var data map[string]interface{}
+	err := json.Unmarshal(log, &data)
+	if err != nil {
+		errExit(err)
+	}
+	return events.FormatLog(data)
 }
